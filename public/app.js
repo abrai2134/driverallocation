@@ -1,0 +1,553 @@
+'use strict';
+
+// ---------- small helpers ----------
+const $app = document.getElementById('app');
+const state = { pub: { orgName: 'Driver Allocation', vehicleTypes: ['4W', '3W', '2W'] }, me: null, tab: 'today', admin: null, from: null, to: null };
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const VEHICLE_NAMES = { '4W': 'Four-wheeler', '3W': 'Three-wheeler', '2W': 'Two-wheeler' };
+
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch('/api' + path, {
+    method: opts.method || 'GET',
+    headers: opts.body ? { 'Content-Type': 'application/json' } : {},
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    credentials: 'same-origin',
+  });
+  let data = {};
+  try { data = await res.json(); } catch { /* empty */ }
+  if (res.status === 401 && path !== '/login') { state.me = null; render(); throw new Error(data.error || 'Please log in'); }
+  if (!res.ok) throw new Error(data.error || 'Request failed');
+  return data;
+}
+
+function toast(msg, bad) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast' + (bad ? ' bad' : '');
+  t.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => (t.hidden = true), 3200);
+}
+
+function dateObj(d) { return new Date(d + 'T00:00:00Z'); }
+function fmtDate(d, opts = { weekday: 'short', day: 'numeric', month: 'short' }) {
+  return dateObj(d).toLocaleDateString('en-IN', { ...opts, timeZone: 'UTC' });
+}
+function addDays(d, n) { const x = dateObj(d); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); }
+function dayName(d) { return DAYS[dateObj(d).getUTCDay()]; }
+
+function vbadge(t) { return `<span class="badge ${t === '4W' ? 'w4' : t === '3W' ? 'w3' : 'w2'}">${esc(t)}</span>`; }
+function telLink(phone, label) {
+  if (!phone) return '';
+  return `<a href="tel:${esc(phone.replace(/[^\d+]/g, ''))}">${esc(label || phone)}</a>`;
+}
+
+const modal = document.getElementById('modal');
+const modalBody = document.getElementById('modal-body');
+function openModal(html, onSubmit) {
+  modalBody.innerHTML = html;
+  modalBody.onsubmit = async (e) => {
+    const btn = e.submitter;
+    if (btn && btn.value === 'cancel') return; // let dialog close
+    e.preventDefault();
+    const err = modalBody.querySelector('.error');
+    if (err) err.remove();
+    try {
+      if (btn) btn.disabled = true;
+      await onSubmit(new FormData(modalBody), modalBody);
+      modal.close();
+    } catch (ex) {
+      modalBody.querySelector('.actions').insertAdjacentHTML('beforebegin', `<div class="error">${esc(ex.message)}</div>`);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  };
+  modal.showModal();
+}
+
+// ---------- boot ----------
+async function boot() {
+  try { state.pub = await api('/public'); } catch { /* keep defaults */ }
+  document.title = state.pub.orgName;
+  try { state.me = await api('/me'); } catch { state.me = null; }
+  render();
+}
+
+function render() {
+  if (!state.me || !state.me.role) return renderLogin();
+  if (state.me.role === 'admin') return renderAdmin();
+  if (state.me.role === 'unit') return renderUnit();
+  if (state.me.role === 'driver') return renderDriver();
+}
+
+function topbar(subtitle) {
+  return `<div class="topbar">
+    <div><div class="title">${esc(state.pub.orgName)}</div><div class="who">${esc(subtitle)}</div></div>
+    <div class="spacer"></div>
+    <button id="logout">Log out</button>
+  </div>`;
+}
+function bindLogout() {
+  document.getElementById('logout').onclick = async () => {
+    await api('/logout', { method: 'POST' }).catch(() => {});
+    state.me = null;
+    state.admin = null;
+    render();
+  };
+}
+
+// ---------- login ----------
+function renderLogin(role = localStorageGet('role') || 'unit') {
+  const labels = { unit: 'Unit login ID', driver: 'Driver login ID (usually phone no.)', admin: 'Admin username' };
+  $app.innerHTML = `<div class="login">
+    <div class="brand"><div class="logo">🚚</div><h1>${esc(state.pub.orgName)}</h1><div class="muted">Daily driver allocation</div></div>
+    <div class="card">
+      <div class="role-switch">
+        <button type="button" data-role="unit" class="${role === 'unit' ? 'on' : ''}"><span>🏢</span>Unit</button>
+        <button type="button" data-role="driver" class="${role === 'driver' ? 'on' : ''}"><span>🧑‍✈️</span>Driver</button>
+        <button type="button" data-role="admin" class="${role === 'admin' ? 'on' : ''}"><span>🔑</span>Admin</button>
+      </div>
+      <form id="login-form">
+        <label>${labels[role]}</label>
+        <input name="username" autocomplete="username" autocapitalize="none" required>
+        <label>Password${role === 'driver' ? ' / PIN' : ''}</label>
+        <input name="password" type="password" autocomplete="current-password" required>
+        <button class="primary" type="submit">Log in</button>
+      </form>
+    </div>
+    <p class="muted small" style="text-align:center">Ask your admin for your login ID and password.</p>
+  </div>`;
+  $app.querySelectorAll('[data-role]').forEach((b) => (b.onclick = () => { localStorageSet('role', b.dataset.role); renderLogin(b.dataset.role); }));
+  const form = document.getElementById('login-form');
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const old = form.querySelector('.error');
+    if (old) old.remove();
+    try {
+      await api('/login', { method: 'POST', body: { role, username: fd.get('username'), password: fd.get('password') } });
+      state.me = await api('/me');
+      state.tab = 'today';
+      render();
+    } catch (ex) {
+      form.insertAdjacentHTML('beforeend', `<div class="error">${esc(ex.message)}</div>`);
+    }
+  };
+}
+function localStorageGet(k) { try { return localStorage.getItem('da_' + k); } catch { return null; } }
+function localStorageSet(k, v) { try { localStorage.setItem('da_' + k, v); } catch { /* ignore */ } }
+
+// ---------- unit view ----------
+async function renderUnit() {
+  $app.innerHTML = topbar('Unit: ' + state.me.name) + '<div class="wrap"><div class="loading">Loading…</div></div>';
+  bindLogout();
+  const data = await api('/unit/home');
+  const [first, ...rest] = data.days;
+  const driverBlock = (d) => d
+    ? `<div class="person"><div class="big">${esc(d.name)}</div>
+        <div class="line">${esc(VEHICLE_NAMES[d.vehicleType] || d.vehicleType)}${d.vehicleNo ? ' · ' + esc(d.vehicleNo) : ''}</div>
+        ${d.phone ? `<a class="call" href="tel:${esc(d.phone.replace(/[^\d+]/g, ''))}">📞 Call ${esc(d.phone)}</a>` : ''}</div>`
+    : `<div class="person"><div class="big">No driver available</div><div class="line">Please contact the admin.</div></div>`;
+  const hero = !first.working
+    ? `<div class="hero off"><div class="label">Today · ${esc(fmtDate(first.date))}</div><div class="big">Holiday / off day</div><div class="line">No deliveries scheduled.</div></div>`
+    : `<div class="hero"><div class="label">Your driver today · ${esc(fmtDate(first.date))}</div>${first.drivers.map(driverBlock).join('') || driverBlock(null)}</div>`;
+  const list = rest.map((d) => `<div class="day"><div class="date">${esc(dayName(d.date))}<small>${esc(fmtDate(d.date, { day: 'numeric', month: 'short' }))}</small></div>
+    <div>${!d.working ? '<span class="muted">Off day</span>' : d.drivers.map((x) => x ? `<div><b>${esc(x.name)}</b> ${vbadge(x.vehicleType)} ${telLink(x.phone)}</div>` : '<div class="empty">Not assigned</div>').join('')}</div></div>`).join('');
+  $app.querySelector('.wrap').innerHTML = `${hero}<div class="card"><h2>Next days</h2><div class="daylist">${list}</div></div>`;
+}
+
+// ---------- driver view ----------
+async function renderDriver() {
+  $app.innerHTML = topbar('Driver: ' + state.me.name) + '<div class="wrap"><div class="loading">Loading…</div></div>';
+  bindLogout();
+  const data = await api('/driver/home');
+  const [first, ...rest] = data.days;
+  let hero;
+  if (!first.working) hero = `<div class="hero off"><div class="label">Today · ${esc(fmtDate(first.date))}</div><div class="big">Off day</div></div>`;
+  else if (first.onLeave) hero = `<div class="hero off"><div class="label">Today · ${esc(fmtDate(first.date))}</div><div class="big">You are on leave</div></div>`;
+  else if (!first.unit) hero = `<div class="hero off"><div class="label">Today · ${esc(fmtDate(first.date))}</div><div class="big">Rest day</div><div class="line">No unit assigned to you today.</div></div>`;
+  else {
+    const u = first.unit;
+    hero = `<div class="hero"><div class="label">Today you serve · ${esc(fmtDate(first.date))}</div>
+      <div class="big">${esc(u.name)}</div>
+      ${u.address ? `<div class="line">📍 ${esc(u.address)}</div>` : ''}
+      ${u.contactName ? `<div class="line">👤 ${esc(u.contactName)}</div>` : ''}
+      <div class="row">${u.phone ? `<a class="call" href="tel:${esc(u.phone.replace(/[^\d+]/g, ''))}">📞 Call ${esc(u.phone)}</a>` : ''}
+      ${u.address ? `<a class="call" target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(u.address)}">🗺️ Map</a>` : ''}</div></div>`;
+  }
+  const list = rest.map((d) => `<div class="day"><div class="date">${esc(dayName(d.date))}<small>${esc(fmtDate(d.date, { day: 'numeric', month: 'short' }))}</small></div>
+    <div>${!d.working ? '<span class="muted">Off day</span>' : d.onLeave ? '<span class="badge warn">Leave</span>' : d.unit ? `<b>${esc(d.unit.name)}</b>${d.unit.address ? `<div class="muted small">${esc(d.unit.address)}</div>` : ''}` : '<span class="muted">Rest day</span>'}</div></div>`).join('');
+  $app.querySelector('.wrap').innerHTML = `${hero}
+    <div class="card"><div class="row"><h2>Next days</h2><div class="spacer"></div><span class="badge ok">${data.monthDuties} duties this month</span></div><div class="daylist">${list}</div></div>`;
+}
+
+// ---------- admin ----------
+const TABS = [
+  ['today', 'Today'],
+  ['schedule', 'Schedule'],
+  ['units', 'Units'],
+  ['drivers', 'Drivers'],
+  ['leaves', 'Leave'],
+  ['report', 'Fairness report'],
+  ['settings', 'Settings'],
+];
+
+async function loadAdmin() {
+  const q = state.from ? `?from=${state.from}&to=${state.to}` : '';
+  state.admin = await api('/admin/data' + q);
+  if (!state.from) { state.from = state.admin.from; state.to = state.admin.to; }
+}
+
+async function renderAdmin() {
+  if (!document.querySelector('.tabs')) {
+    $app.innerHTML = topbar('Admin: ' + state.me.name) +
+      `<nav class="tabs">${TABS.map(([k, l]) => `<button data-tab="${k}">${l}</button>`).join('')}</nav><div class="wrap" id="main"><div class="loading">Loading…</div></div>`;
+    bindLogout();
+    $app.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => { state.tab = b.dataset.tab; renderAdmin(); }));
+  }
+  $app.querySelectorAll('[data-tab]').forEach((b) => b.classList.toggle('on', b.dataset.tab === state.tab));
+  try {
+    await loadAdmin();
+  } catch (ex) {
+    if (state.me) document.getElementById('main').innerHTML = `<div class="error">${esc(ex.message)}</div>`;
+    return;
+  }
+  const main = document.getElementById('main');
+  const views = { today: adminToday, schedule: adminSchedule, units: adminUnits, drivers: adminDrivers, leaves: adminLeaves, report: adminReport, settings: adminSettings };
+  await views[state.tab](main);
+}
+
+const A = () => state.admin;
+const unitName = (id) => (A().allUnits.find((u) => u.id === id) || {}).name || '(removed unit)';
+const driverOf = (id) => A().drivers.find((d) => d.id === id) || A().allDrivers.find((d) => d.id === id);
+const onLeaveOn = (driverId, date) => A().leaves.some((l) => l.driverId === driverId && l.from <= date && date <= l.to);
+
+// --- Today ---
+function adminToday(main) {
+  const t = A().today;
+  const day = A().days.find((d) => d.date === t);
+  const todays = A().assignments.filter((a) => a.date === t);
+  const units = A().units.filter((u) => u.active);
+  if (!units.length || !A().drivers.length) {
+    main.innerHTML = `<div class="card"><h2>Welcome! Let's set things up</h2>
+      <ol><li>Go to <b>Units</b> and add your units (each gets its own login).</li>
+      <li>Go to <b>Drivers</b> and add your drivers with their vehicle type (each gets a login).</li>
+      <li>The schedule is created automatically and rotates fairly every day.</li>
+      <li>Share the website link with your team; units and drivers log in to see today's plan.</li></ol></div>`;
+    return;
+  }
+  const busy = new Set(todays.map((a) => a.driverId).filter(Boolean));
+  const free = A().drivers.filter((d) => d.active && !busy.has(d.id));
+  const cards = units.map((u) => {
+    const rows = todays.filter((a) => a.unitId === u.id);
+    const inner = rows.map((a) => {
+      const d = a.driverId && driverOf(a.driverId);
+      return `<div class="drv">${d ? `<b>${esc(d.name)}</b> ${vbadge(d.vehicleType)} ${a.manual ? '<span class="badge manual">changed</span>' : ''}<div class="small">${telLink(d.phone)} ${d.vehicleNo ? '· ' + esc(d.vehicleNo) : ''}</div>` : '<span class="empty">No driver</span>'}
+        <div><button class="link small" data-change="${esc(a.unitId)}|${a.slot}">Change</button></div></div>`;
+    }).join('');
+    return `<div class="card unit-card"><div class="name">${esc(u.name)}</div>${u.contactName ? `<div class="muted small">${esc(u.contactName)} ${telLink(u.phone)}</div>` : ''}${inner}</div>`;
+  }).join('');
+  main.innerHTML = `<div class="row section"><div><h1>Today · ${esc(fmtDate(t, { weekday: 'long', day: 'numeric', month: 'long' }))}</h1>
+      <div class="muted">${day && day.working ? `${todays.filter((a) => a.driverId).length} of ${todays.length} slots filled` : 'Off day / holiday — no allocation'}</div></div>
+      <div class="spacer"></div>
+      ${day && day.working ? '<button id="wa">📤 Share on WhatsApp</button>' : ''}</div>
+    ${day && day.working ? `<div class="grid">${cards}</div>
+    <div class="card" style="margin-top:12px"><h3>Not on duty today</h3>${free.length ? free.map((d) => `${esc(d.name)} ${onLeaveOn(d.id, t) ? '<span class="badge warn">leave</span>' : '<span class="badge">rest</span>'}`).join(' &nbsp; ') : '<span class="muted">Everyone is on duty.</span>'}</div>` : ''}`;
+  main.querySelectorAll('[data-change]').forEach((b) => (b.onclick = () => { const [u, s] = b.dataset.change.split('|'); changeSlot(t, u, Number(s)); }));
+  const wa = document.getElementById('wa');
+  if (wa) wa.onclick = () => {
+    const lines = [`*${state.pub.orgName} – Driver plan ${fmtDate(t)}*`];
+    for (const u of units) {
+      for (const a of todays.filter((x) => x.unitId === u.id)) {
+        const d = a.driverId && driverOf(a.driverId);
+        lines.push(`• ${u.name}: ${d ? `${d.name} (${d.vehicleType}${d.phone ? ', ' + d.phone : ''})` : 'NO DRIVER'}`);
+      }
+    }
+    window.open('https://wa.me/?text=' + encodeURIComponent(lines.join('\n')), '_blank');
+  };
+}
+
+function changeSlot(date, unitId, slot) {
+  const current = A().assignments.find((a) => a.date === date && a.unitId === unitId && a.slot === slot);
+  const unit = A().units.find((u) => u.id === unitId);
+  const types = (unit && unit.vehicleTypes) || [];
+  const opts = A().drivers.filter((d) => d.active).map((d) => {
+    const leave = onLeaveOn(d.id, date);
+    const wrongVehicle = types.length && !types.includes(d.vehicleType);
+    const where = A().assignments.find((a) => a.date === date && a.driverId === d.id);
+    const note = leave ? ' — on leave' : wrongVehicle ? ' — vehicle not allowed' : where && where !== current ? ` — at ${unitName(where.unitId)} (will swap)` : '';
+    return `<option value="${esc(d.id)}" ${current && current.driverId === d.id ? 'selected' : ''} ${leave || wrongVehicle ? 'disabled' : ''}>${esc(d.name)} (${esc(d.vehicleType)})${esc(note)}</option>`;
+  }).join('');
+  openModal(`<h2>Change driver</h2><div class="muted">${esc(unitName(unitId))} · ${esc(fmtDate(date))}</div>
+    <label>Driver</label><select name="driverId"><option value="">— No driver —</option>${opts}</select>
+    <p class="muted small">Later days are re-balanced automatically so duty stays equal.</p>
+    <div class="actions"><button value="cancel">Cancel</button><button class="primary" value="ok">Save</button></div>`,
+  async (fd) => {
+    await api('/admin/assign', { method: 'POST', body: { date, unitId, slot, driverId: fd.get('driverId') || null } });
+    toast('Saved');
+    renderAdmin();
+  });
+}
+
+// --- Schedule ---
+function adminSchedule(main) {
+  const units = A().units.filter((u) => u.active);
+  const t = A().today;
+  const head = units.map((u) => `<th>${esc(u.name)}</th>`).join('');
+  const body = A().days.map((day) => {
+    const cls = [day.date === t ? 'today' : '', day.working ? '' : 'off'].join(' ');
+    if (!day.working) return `<tr class="${cls}"><td class="sticky">${esc(fmtDate(day.date))}</td><td colspan="${units.length}">${day.holiday ? 'Holiday' : 'Off day'}</td></tr>`;
+    const cells = units.map((u) => {
+      const rows = A().assignments.filter((a) => a.date === day.date && a.unitId === u.id);
+      const past = day.date < t;
+      if (!rows.length) return `<td class="cell past"><span class="muted small">${past ? '—' : 'not planned'}</span></td>`;
+      return `<td class="cell ${past ? 'past' : ''}">${rows.map((a) => {
+        const d = a.driverId && driverOf(a.driverId);
+        return `<div ${past ? '' : `data-slot="${esc(day.date)}|${esc(u.id)}|${a.slot}"`}>${d ? `<span class="dname">${esc(d.name)}</span> ${vbadge(d.vehicleType)}${a.manual ? ' <span class="badge manual">✎</span>' : ''}` : '<span class="empty">none</span>'}</div>`;
+      }).join('')}</td>`;
+    }).join('');
+    return `<tr class="${cls}"><td class="sticky">${esc(fmtDate(day.date))}</td>${cells}</tr>`;
+  }).join('');
+  main.innerHTML = `<div class="row section no-print">
+      <button id="prev">◀ Prev week</button><button id="this">This week</button><button id="next">Next week ▶</button>
+      <input type="date" id="from" value="${esc(A().from)}" style="width:auto"> to <input type="date" id="to" value="${esc(A().to)}" style="width:auto">
+      <button id="go">Show</button><div class="spacer"></div>
+      <button id="print">🖨️ Print</button><button id="regen" class="primary">↻ Re-balance</button></div>
+    <p class="muted small no-print">Tap a name to change it. ✎ = changed by admin. Days are planned automatically ${A().settings.horizonDays} days ahead.</p>
+    <h2 style="display:none" class="print-title">${esc(state.pub.orgName)} – ${esc(fmtDate(A().from))} to ${esc(fmtDate(A().to))}</h2>
+    <div class="table-wrap"><table class="sched"><thead><tr><th class="sticky">Date</th>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+  const go = (from, to) => { state.from = from; state.to = to; renderAdmin(); };
+  document.getElementById('prev').onclick = () => go(addDays(state.from, -7), addDays(state.to, -7));
+  document.getElementById('next').onclick = () => go(addDays(state.from, 7), addDays(state.to, 7));
+  document.getElementById('this').onclick = () => go(t, addDays(t, 6));
+  document.getElementById('go').onclick = () => go(document.getElementById('from').value, document.getElementById('to').value);
+  document.getElementById('print').onclick = () => window.print();
+  document.getElementById('regen').onclick = () => openModal(`<h2>Re-balance schedule</h2>
+      <p>Re-create the plan from the chosen day onward using the fairness rules. Past days never change.</p>
+      <label>Starting from</label><input type="date" name="from" value="${esc(addDays(t, 1))}" min="${esc(t)}">
+      <label class="check"><input type="checkbox" name="keepManual" checked> Keep my manual changes</label>
+      <div class="actions"><button value="cancel">Cancel</button><button class="primary" value="ok">Re-balance</button></div>`,
+    async (fd) => {
+      await api('/admin/regenerate', { method: 'POST', body: { from: fd.get('from'), keepManual: fd.get('keepManual') === 'on' } });
+      toast('Schedule re-balanced');
+      renderAdmin();
+    });
+  main.querySelectorAll('[data-slot]').forEach((el) => (el.onclick = () => { const [d, u, s] = el.dataset.slot.split('|'); changeSlot(d, u, Number(s)); }));
+}
+
+// --- Units ---
+function adminUnits(main) {
+  const rows = A().units.map((u) => `<tr>
+    <td><b>${esc(u.name)}</b>${u.address ? `<div class="muted small">${esc(u.address)}</div>` : ''}</td>
+    <td>${esc(u.contactName)}<div class="small">${telLink(u.phone)}</div></td>
+    <td class="num">${u.driversNeeded}</td>
+    <td>${u.vehicleTypes.length ? u.vehicleTypes.map(vbadge).join(' ') : '<span class="muted small">Any</span>'}</td>
+    <td><code>${esc(u.username)}</code></td>
+    <td>${u.active ? '<span class="badge ok">Active</span>' : '<span class="badge">Inactive</span>'}</td>
+    <td><button class="link" data-edit="${esc(u.id)}">Edit</button></td></tr>`).join('');
+  main.innerHTML = `<div class="row section"><h1>Units</h1><div class="spacer"></div><button class="primary" id="add">+ Add unit</button></div>
+    ${A().units.length ? `<div class="table-wrap"><table><thead><tr><th>Unit</th><th>Contact</th><th class="num">Drivers / day</th><th>Vehicles</th><th>Login ID</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="card muted">No units yet. Add your first unit.</div>'}`;
+  document.getElementById('add').onclick = () => unitForm();
+  main.querySelectorAll('[data-edit]').forEach((b) => (b.onclick = () => unitForm(A().units.find((u) => u.id === b.dataset.edit))));
+}
+
+function unitForm(u) {
+  const v = u || { name: '', contactName: '', phone: '', address: '', driversNeeded: 1, vehicleTypes: [], username: '', active: true };
+  openModal(`<h2>${u ? 'Edit unit' : 'Add unit'}</h2>
+    <div class="form-grid">
+      <div><label>Unit name *</label><input name="name" required value="${esc(v.name)}"></div>
+      <div><label>Drivers needed per day</label><input name="driversNeeded" type="number" min="1" max="10" value="${esc(v.driversNeeded)}"></div>
+      <div><label>Contact person</label><input name="contactName" value="${esc(v.contactName)}"></div>
+      <div><label>Phone</label><input name="phone" type="tel" value="${esc(v.phone)}"></div>
+    </div>
+    <label>Address</label><textarea name="address">${esc(v.address)}</textarea>
+    <label>Vehicle types this unit accepts</label>
+    <div>${state.pub.vehicleTypes.map((t) => `<label class="check"><input type="checkbox" name="vt" value="${t}" ${v.vehicleTypes.includes(t) ? 'checked' : ''}> ${t} ${VEHICLE_NAMES[t]}</label>`).join('')}</div>
+    <div class="muted small">Leave all unticked to accept any vehicle.</div>
+    <div class="form-grid">
+      <div><label>Login ID *</label><input name="username" autocapitalize="none" value="${esc(v.username)}" placeholder="e.g. unit1"></div>
+      <div><label>Password ${u ? '(leave blank to keep)' : '*'}</label><input name="password" type="text" autocomplete="new-password" ${u ? '' : 'required'}></div>
+    </div>
+    <label class="check"><input type="checkbox" name="active" ${v.active ? 'checked' : ''}> Active (gets a driver every working day)</label>
+    <div class="actions">${u ? '<button type="button" class="danger" id="del">Remove</button><div class="spacer"></div>' : ''}<button value="cancel">Cancel</button><button class="primary" value="ok">Save</button></div>`,
+  async (fd) => {
+    const body = {
+      name: fd.get('name'), driversNeeded: fd.get('driversNeeded'), contactName: fd.get('contactName'), phone: fd.get('phone'),
+      address: fd.get('address'), vehicleTypes: fd.getAll('vt'), username: fd.get('username'), password: fd.get('password'), active: fd.get('active') === 'on',
+    };
+    await api(u ? `/admin/units/${u.id}` : '/admin/units', { method: u ? 'PUT' : 'POST', body });
+    toast(u ? 'Unit updated' : 'Unit added – schedule updated');
+    renderAdmin();
+  });
+  const del = document.getElementById('del');
+  if (del) del.onclick = async () => {
+    if (!confirm(`Remove ${u.name}? Past history is kept.`)) return;
+    try { await api(`/admin/units/${u.id}`, { method: 'DELETE' }); modal.close(); toast('Unit removed'); renderAdmin(); } catch (ex) { toast(ex.message, true); }
+  };
+}
+
+// --- Drivers ---
+function adminDrivers(main) {
+  const rows = A().drivers.map((d) => `<tr>
+    <td><b>${esc(d.name)}</b></td><td>${telLink(d.phone)}</td>
+    <td>${vbadge(d.vehicleType)} <span class="small">${esc(d.vehicleNo)}</span></td>
+    <td><code>${esc(d.username)}</code></td>
+    <td>${!d.active ? '<span class="badge">Inactive</span>' : onLeaveOn(d.id, A().today) ? '<span class="badge warn">On leave</span>' : '<span class="badge ok">Active</span>'}</td>
+    <td><button class="link" data-edit="${esc(d.id)}">Edit</button></td></tr>`).join('');
+  main.innerHTML = `<div class="row section"><h1>Drivers</h1><div class="spacer"></div><button class="primary" id="add">+ Add driver</button></div>
+    ${A().drivers.length ? `<div class="table-wrap"><table><thead><tr><th>Name</th><th>Phone</th><th>Vehicle</th><th>Login ID</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="card muted">No drivers yet. Add your first driver.</div>'}
+    <p class="muted small">A new driver starts level with the others, so they are not given extra days to "catch up".</p>`;
+  document.getElementById('add').onclick = () => driverForm();
+  main.querySelectorAll('[data-edit]').forEach((b) => (b.onclick = () => driverForm(A().drivers.find((d) => d.id === b.dataset.edit))));
+}
+
+function driverForm(d) {
+  const v = d || { name: '', phone: '', vehicleType: '4W', vehicleNo: '', username: '', active: true };
+  openModal(`<h2>${d ? 'Edit driver' : 'Add driver'}</h2>
+    <div class="form-grid">
+      <div><label>Name *</label><input name="name" required value="${esc(v.name)}"></div>
+      <div><label>Phone</label><input name="phone" type="tel" value="${esc(v.phone)}"></div>
+      <div><label>Vehicle type *</label><select name="vehicleType">${state.pub.vehicleTypes.map((t) => `<option value="${t}" ${v.vehicleType === t ? 'selected' : ''}>${t} – ${VEHICLE_NAMES[t]}</option>`).join('')}</select></div>
+      <div><label>Vehicle number</label><input name="vehicleNo" value="${esc(v.vehicleNo)}" placeholder="MH 01 AB 1234"></div>
+      <div><label>Login ID</label><input name="username" autocapitalize="none" value="${esc(v.username)}" placeholder="defaults to phone number"></div>
+      <div><label>Password / PIN ${d ? '(leave blank to keep)' : '*'}</label><input name="password" type="text" autocomplete="new-password" ${d ? '' : 'required'}></div>
+    </div>
+    <label class="check"><input type="checkbox" name="active" ${v.active ? 'checked' : ''}> Active (included in the rotation)</label>
+    <div class="actions">${d ? '<button type="button" class="danger" id="del">Remove</button><div class="spacer"></div>' : ''}<button value="cancel">Cancel</button><button class="primary" value="ok">Save</button></div>`,
+  async (fd) => {
+    const body = {
+      name: fd.get('name'), phone: fd.get('phone'), vehicleType: fd.get('vehicleType'), vehicleNo: fd.get('vehicleNo'),
+      username: fd.get('username'), password: fd.get('password'), active: fd.get('active') === 'on',
+    };
+    await api(d ? `/admin/drivers/${d.id}` : '/admin/drivers', { method: d ? 'PUT' : 'POST', body });
+    toast(d ? 'Driver updated' : 'Driver added – schedule updated');
+    renderAdmin();
+  });
+  const del = document.getElementById('del');
+  if (del) del.onclick = async () => {
+    if (!confirm(`Remove ${d.name}? Past history is kept.`)) return;
+    try { await api(`/admin/drivers/${d.id}`, { method: 'DELETE' }); modal.close(); toast('Driver removed'); renderAdmin(); } catch (ex) { toast(ex.message, true); }
+  };
+}
+
+// --- Leave ---
+function adminLeaves(main) {
+  const t = A().today;
+  const opts = A().drivers.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} (${esc(d.vehicleType)})</option>`).join('');
+  const rows = A().leaves.map((l) => {
+    const d = driverOf(l.driverId);
+    const status = l.to < t ? '<span class="badge">Past</span>' : l.from <= t ? '<span class="badge warn">Now</span>' : '<span class="badge ok">Upcoming</span>';
+    return `<tr><td><b>${esc(d ? d.name : '(removed)')}</b></td><td>${esc(fmtDate(l.from))}${l.to !== l.from ? ' → ' + esc(fmtDate(l.to)) : ''}</td><td>${esc(l.reason)}</td><td>${status}</td>
+      <td>${l.to >= t ? `<button class="link" data-del="${esc(l.id)}">Cancel leave</button>` : ''}</td></tr>`;
+  }).join('');
+  main.innerHTML = `<h1>Leave / absence</h1>
+    <form class="card section" id="leave-form"><div class="form-grid">
+      <div><label>Driver</label><select name="driverId" required>${opts}</select></div>
+      <div><label>From</label><input type="date" name="from" value="${esc(t)}" required></div>
+      <div><label>To</label><input type="date" name="to" value="${esc(t)}" required></div>
+      <div><label>Reason</label><input name="reason" placeholder="optional"></div></div>
+      <div style="margin-top:12px"><button class="primary">Add leave</button></div>
+      <p class="muted small">If the driver was on duty today, only their slot is filled by a free driver; future days are re-balanced.</p></form>
+    ${A().leaves.length ? `<div class="table-wrap"><table><thead><tr><th>Driver</th><th>Dates</th><th>Reason</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : ''}`;
+  const form = document.getElementById('leave-form');
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    try {
+      await api('/admin/leaves', { method: 'POST', body: Object.fromEntries(fd) });
+      toast('Leave added – schedule updated');
+      renderAdmin();
+    } catch (ex) { toast(ex.message, true); }
+  };
+  main.querySelectorAll('[data-del]').forEach((b) => (b.onclick = async () => {
+    try { await api(`/admin/leaves/${b.dataset.del}`, { method: 'DELETE' }); toast('Leave cancelled'); renderAdmin(); } catch (ex) { toast(ex.message, true); }
+  }));
+}
+
+// --- Fairness report ---
+async function adminReport(main) {
+  const t = A().today;
+  const from = state.repFrom || addDays(t, -29);
+  const to = state.repTo || t;
+  const s = await api(`/admin/stats?from=${from}&to=${to}`);
+  const max = Math.max(1, ...s.rows.flatMap((r) => Object.values(r.perUnit)));
+  const heat = (n) => `<span class="heat" style="background:rgba(46,117,182,${(0.08 + 0.5 * n / max).toFixed(2)})">${n}</span>`;
+  const totals = s.rows.filter((r) => r.active).map((r) => r.total);
+  const spread = totals.length ? Math.max(...totals) - Math.min(...totals) : 0;
+  main.innerHTML = `<div class="row section"><h1>Fairness report</h1><div class="spacer"></div>
+      <input type="date" id="rf" value="${esc(from)}" style="width:auto"> to <input type="date" id="rt" value="${esc(to)}" style="width:auto"><button id="rgo">Show</button></div>
+    <div class="card section">Difference between most and least duties (active drivers): <b>${spread}</b> ${spread <= 1 ? '<span class="badge ok">Balanced</span>' : '<span class="badge warn">Check leave / vehicle rules</span>'}
+      ${s.unfilled ? `<div class="small" style="margin-top:6px"><span class="badge bad">${s.unfilled} unfilled slots</span> – not enough drivers on some days.</div>` : ''}</div>
+    <div class="table-wrap"><table><thead><tr><th>Driver</th><th class="num">Total duties</th><th class="num">Leave days</th>${s.units.map((u) => `<th class="num">${esc(u.name)}</th>`).join('')}</tr></thead>
+    <tbody>${s.rows.map((r) => `<tr><td><b>${esc(r.name)}</b> ${vbadge(r.vehicleType)}${r.active ? '' : ' <span class="badge">inactive</span>'}</td><td class="num"><b>${r.total}</b></td><td class="num">${r.leaveDays}</td>${s.units.map((u) => `<td class="num">${heat(r.perUnit[u.id] || 0)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+    <p class="muted small">Counts include planned future days up to the end date. Each column shows how often a driver served that unit — an even spread means good rotation.</p>`;
+  document.getElementById('rgo').onclick = () => { state.repFrom = document.getElementById('rf').value; state.repTo = document.getElementById('rt').value; renderAdmin(); };
+}
+
+// --- Settings ---
+function adminSettings(main) {
+  const s = A().settings;
+  main.innerHTML = `<h1>Settings</h1>
+    <form class="card section" id="set-form">
+      <div class="form-grid">
+        <div><label>Company / app name</label><input name="orgName" value="${esc(s.orgName)}"></div>
+        <div><label>Plan ahead (days)</label><input name="horizonDays" type="number" min="1" max="60" value="${esc(s.horizonDays)}"></div>
+        <div><label>Time zone</label><input name="timezone" value="${esc(s.timezone)}"></div>
+      </div>
+      <label>Weekly off days (no deliveries)</label>
+      <div>${DAYS.map((d, i) => `<label class="check"><input type="checkbox" name="off" value="${i}" ${s.offDays.includes(i) ? 'checked' : ''}> ${d}</label>`).join('')}</div>
+      <label>Holidays (one date per line, YYYY-MM-DD)</label>
+      <textarea name="holidays" placeholder="2026-11-08">${esc(s.holidays.join('\n'))}</textarea>
+      <div style="margin-top:12px"><button class="primary">Save settings</button></div>
+    </form>
+    <form class="card section" id="pw-form"><h2>Admin login</h2>
+      <div class="form-grid">
+        <div><label>Username</label><input name="username" value="${esc(state.me.name)}" autocapitalize="none"></div>
+        <div><label>Current password</label><input name="current" type="password" required autocomplete="current-password"></div>
+        <div><label>New password</label><input name="next" type="password" required minlength="6" autocomplete="new-password"></div>
+      </div><div style="margin-top:12px"><button class="primary">Change password</button></div></form>
+    <div class="card"><h2>Backup</h2><p class="muted">Download all data (units, drivers, history). Keep a copy safe; you can restore it any time.</p>
+      <div class="row"><a class="btn" href="/api/admin/backup">⬇️ Download backup</a>
+      <label class="btn" style="margin:0;font-weight:500">⬆️ Restore from file<input type="file" id="restore" accept=".json,application/json" hidden></label></div></div>`;
+  const sf = document.getElementById('set-form');
+  sf.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(sf);
+    try {
+      await api('/admin/settings', { method: 'PUT', body: {
+        orgName: fd.get('orgName'), horizonDays: fd.get('horizonDays'), timezone: fd.get('timezone'),
+        offDays: fd.getAll('off').map(Number), holidays: String(fd.get('holidays')).split(/[\s,]+/).filter(Boolean),
+      } });
+      state.pub.orgName = fd.get('orgName') || state.pub.orgName;
+      toast('Settings saved – schedule updated');
+      $app.innerHTML = '';
+      renderAdmin();
+    } catch (ex) { toast(ex.message, true); }
+  };
+  const pf = document.getElementById('pw-form');
+  pf.onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      await api('/admin/password', { method: 'POST', body: Object.fromEntries(new FormData(pf)) });
+      state.me = await api('/me');
+      toast('Password changed');
+      pf.reset();
+    } catch (ex) { toast(ex.message, true); }
+  };
+  document.getElementById('restore').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (!confirm('Replace ALL current data with this backup?')) return;
+    try {
+      await api('/admin/restore', { method: 'POST', body: JSON.parse(await file.text()) });
+      toast('Backup restored');
+      renderAdmin();
+    } catch (ex) { toast(ex.message, true); }
+  };
+}
+
+boot();
