@@ -157,7 +157,7 @@ function dayInfo(date) {
 function assignmentsBetween(from, to) {
   return db()
     .assignments.filter((a) => a.date >= from && a.date <= to)
-    .map((a) => ({ date: a.date, unitId: a.unitId, slot: a.slot, driverId: a.driverId, manual: !!a.manual }));
+    .map((a) => ({ date: a.date, unitId: a.unitId, slot: a.slot, driverId: a.driverId, manual: !!a.manual, extra: !!a.extra, reason: a.reason || '' }));
 }
 
 // ---------- unit login ----------
@@ -169,9 +169,58 @@ app.get('/api/unit/home', need('unit'), (req, res) => {
     ...dayInfo(date),
     drivers: db()
       .assignments.filter((a) => a.date === date && a.unitId === u.id && a.driverId)
-      .map((a) => driverView(db().drivers.find((d) => d.id === a.driverId))),
+      .map((a) => ({ ...driverView(db().drivers.find((d) => d.id === a.driverId)), slot: a.slot, extra: !!a.extra, reason: a.reason || '' })),
+    // Emergency drivers other units took that day, so everyone knows where they are.
+    otherExtras: db()
+      .assignments.filter((a) => a.date === date && a.extra && a.driverId && a.unitId !== u.id)
+      .map((a) => ({ driver: (db().drivers.find((d) => d.id === a.driverId) || {}).name, unit: (db().units.find((x) => x.id === a.unitId) || {}).name })),
   }));
   res.json({ today: t, unit: unitView(u), days });
+});
+
+function unitDate(req, res) {
+  const t = today();
+  const date = req.body && req.body.date !== undefined ? req.body.date : req.query.date || t;
+  if (!isValid(date) || date < t || date > addDays(t, 6)) {
+    bad(res, 'Choose a day from today up to 6 days ahead');
+    return null;
+  }
+  return date;
+}
+
+app.get('/api/unit/free', need('unit'), (req, res) => {
+  plan();
+  const date = unitDate(req, res);
+  if (!date) return;
+  res.json({ date, drivers: S.freeDrivers(db(), date).map(driverView) });
+});
+
+app.post('/api/unit/extra', need('unit'), (req, res) => {
+  plan();
+  const date = unitDate(req, res);
+  if (!date) return;
+  const u = req.user.account;
+  try {
+    S.addExtra(db(), date, u.id, str(req.body.driverId), { reason: str(req.body.reason, 200), requestedBy: 'unit' });
+  } catch (e) {
+    return bad(res, e.message);
+  }
+  S.replanFrom(db(), addDays(date, 1), today()); // keep duty equal on the following days
+  store.save();
+  res.json({ ok: true });
+});
+
+app.post('/api/unit/extra/cancel', need('unit'), (req, res) => {
+  const date = unitDate(req, res);
+  if (!date) return;
+  const u = req.user.account;
+  const slot = Number(req.body.slot);
+  const before = db().assignments.length;
+  db().assignments = db().assignments.filter((a) => !(a.date === date && a.unitId === u.id && a.extra && a.slot === slot));
+  if (db().assignments.length === before) return bad(res, 'Nothing to cancel');
+  S.replanFrom(db(), addDays(date, 1), today());
+  store.save();
+  res.json({ ok: true });
 });
 
 // ---------- driver login ----------
@@ -183,6 +232,7 @@ app.get('/api/driver/home', need('driver'), (req, res) => {
     const a = db().assignments.find((x) => x.date === date && x.driverId === d.id);
     return {
       ...dayInfo(date),
+      extra: !!(a && a.extra),
       onLeave: S.onLeave(db(), d.id, date),
       unit: a ? unitView(db().units.find((u) => u.id === a.unitId)) : null,
     };

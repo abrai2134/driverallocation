@@ -177,17 +177,62 @@ async function renderUnit() {
   bindLogout();
   const data = await api('/unit/home');
   const [first, ...rest] = data.days;
+  const extraBadge = (d) => d.extra ? ` <span class="badge warn">Emergency extra</span>` : '';
+  const cancelBtn = (date, d) => d.extra ? `<button class="link small" data-cancel="${esc(date)}|${d.slot}" style="color:inherit;text-decoration:underline">Cancel extra</button>` : '';
   const driverBlock = (d) => d
-    ? `<div class="person"><div class="big">${esc(d.name)}</div>
-        <div class="line">${esc(VEHICLE_NAMES[d.vehicleType] || d.vehicleType)}${d.vehicleNo ? ' · ' + esc(d.vehicleNo) : ''}</div>
-        ${d.phone ? `<a class="call" href="tel:${esc(d.phone.replace(/[^\d+]/g, ''))}">📞 Call ${esc(d.phone)}</a>` : ''}</div>`
+    ? `<div class="person"><div class="big">${esc(d.name)}${extraBadge(d)}</div>
+        <div class="line">${esc(VEHICLE_NAMES[d.vehicleType] || d.vehicleType)}${d.vehicleNo ? ' · ' + esc(d.vehicleNo) : ''}${d.reason ? ' · ' + esc(d.reason) : ''}</div>
+        <div class="row">${d.phone ? `<a class="call" href="tel:${esc(d.phone.replace(/[^\d+]/g, ''))}">📞 Call ${esc(d.phone)}</a>` : ''} ${cancelBtn(first.date, d)}</div></div>`
     : `<div class="person"><div class="big">No driver available</div><div class="line">Please contact the admin.</div></div>`;
-  const hero = !first.working
+  const others = (day) => day.otherExtras.length
+    ? `<div class="muted small" style="margin-top:4px">Emergency: ${day.otherExtras.map((o) => `${esc(o.driver)} → ${esc(o.unit)}`).join(', ')}</div>` : '';
+  const hero = !first.working && !first.drivers.length
     ? `<div class="hero off"><div class="label">Today · ${esc(fmtDate(first.date))}</div><div class="big">Holiday / off day</div><div class="line">No deliveries scheduled.</div></div>`
     : `<div class="hero"><div class="label">Your driver today · ${esc(fmtDate(first.date))}</div>${first.drivers.map(driverBlock).join('') || driverBlock(null)}</div>`;
   const list = rest.map((d) => `<div class="day"><div class="date">${esc(dayName(d.date))}<small>${esc(fmtDate(d.date, { day: 'numeric', month: 'short' }))}</small></div>
-    <div>${!d.working ? '<span class="muted">Off day</span>' : (d.drivers.map((x) => `<div><b>${esc(x.name)}</b> ${vbadge(x.vehicleType)} ${telLink(x.phone)}</div>`).join('') || '<div class="empty">Not assigned</div>')}</div></div>`).join('');
-  $app.querySelector('.wrap').innerHTML = `${hero}<div class="card"><h2>Next days</h2><div class="daylist">${list}</div></div>`;
+    <div>${!d.working && !d.drivers.length ? '<span class="muted">Off day</span>' : (d.drivers.map((x) => `<div><b>${esc(x.name)}</b> ${vbadge(x.vehicleType)}${extraBadge(x)} ${telLink(x.phone)} ${cancelBtn(d.date, x)}</div>`).join('') || '<div class="empty">Not assigned</div>')}${others(d)}</div></div>`).join('');
+  $app.querySelector('.wrap').innerHTML = `${hero}
+    <div class="card section"><div class="row"><div><h2 style="margin:0">Need one more driver?</h2>
+      <div class="muted small">For a shortage or emergency. Only drivers who are free that day are shown; once you take one, no other unit gets them.</div></div>
+      <div class="spacer"></div><button class="primary" id="need-extra">+ Ask for an emergency driver</button></div>
+      ${others(first) ? `<div style="margin-top:8px"><b class="small">Today</b>${others(first)}</div>` : ''}</div>
+    <div class="card"><h2>Next days</h2><div class="daylist">${list}</div></div>`;
+  document.getElementById('need-extra').onclick = () => askExtra(data);
+  $app.querySelectorAll('[data-cancel]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('Cancel this emergency driver? They become free for other units.')) return;
+    const [date, slot] = b.dataset.cancel.split('|');
+    try { await api('/unit/extra/cancel', { method: 'POST', body: { date, slot: Number(slot) } }); toast('Cancelled'); renderUnit(); } catch (ex) { toast(ex.message, true); }
+  }));
+}
+
+function askExtra(data) {
+  const dayOpts = data.days.map((d, i) => `<option value="${esc(d.date)}">${i === 0 ? 'Today' : esc(dayName(d.date))} – ${esc(fmtDate(d.date, { day: 'numeric', month: 'short' }))}</option>`).join('');
+  openModal(`<h2>Ask for an emergency driver</h2>
+    <label>Day</label><select name="date" id="x-date">${dayOpts}</select>
+    <label>Free driver</label><div id="x-list" class="muted">Loading…</div>
+    <label>Reason (optional)</label><input name="reason" placeholder="e.g. extra delivery, driver busy">
+    <div class="actions"><button value="cancel">Cancel</button><button class="primary" value="ok" id="x-ok">Take this driver</button></div>`,
+  async (fd) => {
+    const driverId = fd.get('driverId');
+    if (!driverId) throw new Error('Choose a free driver');
+    await api('/unit/extra', { method: 'POST', body: { date: fd.get('date'), driverId, reason: fd.get('reason') } });
+    toast('Driver reserved for you');
+    renderUnit();
+  });
+  const load = async () => {
+    const box = document.getElementById('x-list');
+    const ok = document.getElementById('x-ok');
+    box.innerHTML = 'Loading…';
+    try {
+      const r = await api('/unit/free?date=' + document.getElementById('x-date').value);
+      ok.disabled = !r.drivers.length;
+      box.innerHTML = r.drivers.length
+        ? r.drivers.map((d, i) => `<label class="check" style="display:flex;margin:6px 0"><input type="radio" name="driverId" value="${esc(d.id)}" ${i === 0 ? 'checked' : ''}> <b>${esc(d.name)}</b> ${vbadge(d.vehicleType)} <span class="small muted">${esc(d.phone)}</span></label>`).join('')
+        : '<div class="error">No driver is free that day – every driver is already working. Please call the admin.</div>';
+    } catch (ex) { box.innerHTML = `<div class="error">${esc(ex.message)}</div>`; }
+  };
+  document.getElementById('x-date').onchange = load;
+  load();
 }
 
 // ---------- driver view ----------
@@ -202,7 +247,7 @@ async function renderDriver() {
   else if (!first.unit) hero = `<div class="hero off"><div class="label">Today · ${esc(fmtDate(first.date))}</div><div class="big">Rest day</div><div class="line">No unit assigned to you today.</div></div>`;
   else {
     const u = first.unit;
-    hero = `<div class="hero"><div class="label">Today you serve · ${esc(fmtDate(first.date))}</div>
+    hero = `<div class="hero"><div class="label">Today you serve · ${esc(fmtDate(first.date))}${first.extra ? ' · emergency request' : ''}</div>
       <div class="big">${esc(u.name)}</div>
       ${u.address ? `<div class="line">📍 ${esc(u.address)}</div>` : ''}
       ${u.contactName ? `<div class="line">👤 ${esc(u.contactName)}</div>` : ''}
@@ -210,7 +255,7 @@ async function renderDriver() {
       ${u.address ? `<a class="call" target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(u.address)}">🗺️ Map</a>` : ''}</div></div>`;
   }
   const list = rest.map((d) => `<div class="day"><div class="date">${esc(dayName(d.date))}<small>${esc(fmtDate(d.date, { day: 'numeric', month: 'short' }))}</small></div>
-    <div>${!d.working ? '<span class="muted">Off day</span>' : d.onLeave ? '<span class="badge warn">Leave</span>' : d.unit ? `<b>${esc(d.unit.name)}</b>${d.unit.address ? `<div class="muted small">${esc(d.unit.address)}</div>` : ''}` : '<span class="muted">Rest day</span>'}</div></div>`).join('');
+    <div>${!d.working ? '<span class="muted">Off day</span>' : d.onLeave ? '<span class="badge warn">Leave</span>' : d.unit ? `<b>${esc(d.unit.name)}</b>${d.extra ? ' <span class="badge warn">Emergency</span>' : ''}${d.unit.address ? `<div class="muted small">${esc(d.unit.address)}</div>` : ''}` : '<span class="muted">Rest day</span>'}</div></div>`).join('');
   $app.querySelector('.wrap').innerHTML = `${hero}
     <div class="card"><div class="row"><h2>Next days</h2><div class="spacer"></div><span class="badge ok">${data.monthDuties} duties this month</span></div><div class="daylist">${list}</div></div>`;
 }
@@ -276,7 +321,7 @@ function adminToday(main) {
     const rows = todays.filter((a) => a.unitId === u.id);
     const inner = rows.map((a) => {
       const d = a.driverId && driverOf(a.driverId);
-      return `<div class="drv">${d ? `<b>${esc(d.name)}</b> ${vbadge(d.vehicleType)}${wantNote(a.unitId, a.slot, d)} ${a.manual ? '<span class="badge manual">changed</span>' : ''}<div class="small">${telLink(d.phone)} ${d.vehicleNo ? '· ' + esc(d.vehicleNo) : ''}</div>` : `<span class="muted">Extra driver ${a.slot + 1} (${esc(slotLabel(slotSpec(a.unitId, a.slot)))}) – no free driver today</span>`}
+      return `<div class="drv">${d ? `<b>${esc(d.name)}</b> ${vbadge(d.vehicleType)}${wantNote(a.unitId, a.slot, d)} ${a.extra ? `<span class="badge warn">emergency extra</span>${a.reason ? ` <span class="small muted">${esc(a.reason)}</span>` : ''}` : a.manual ? '<span class="badge manual">changed</span>' : ''}<div class="small">${telLink(d.phone)} ${d.vehicleNo ? '· ' + esc(d.vehicleNo) : ''}</div>` : `<span class="muted">Extra driver ${a.slot + 1} (${esc(slotLabel(slotSpec(a.unitId, a.slot)))}) – no free driver today</span>`}
         <div><button class="link small" data-change="${esc(a.unitId)}|${a.slot}">Change</button></div></div>`;
     }).join('');
     return `<div class="card unit-card"><div class="name">${esc(u.name)}</div>${u.contactName ? `<div class="muted small">${esc(u.contactName)} ${telLink(u.phone)}</div>` : ''}${inner}</div>`;
@@ -313,8 +358,8 @@ function changeSlot(date, unitId, slot) {
     const note = leave ? ' — on leave' : wrongVehicle ? ' — vehicle not allowed' : where && where !== current ? ` — at ${unitName(where.unitId)} (will swap)` : '';
     return `<option value="${esc(d.id)}" ${current && current.driverId === d.id ? 'selected' : ''} ${leave || wrongVehicle ? 'disabled' : ''}>${esc(d.name)} (${esc(d.vehicleType)})${esc(note)}</option>`;
   }).join('');
-  openModal(`<h2>Change driver</h2><div class="muted">${esc(unitName(unitId))} · driver ${slot + 1} (${esc(slotLabel(spec))}) · ${esc(fmtDate(date))}</div>
-    <label>Driver</label><select name="driverId"><option value="">— No driver —</option>${opts}</select>
+  openModal(`<h2>Change driver</h2><div class="muted">${esc(unitName(unitId))} · ${slot >= 100 ? 'emergency extra (requested by unit)' : `driver ${slot + 1} (${esc(slotLabel(spec))})`} · ${esc(fmtDate(date))}</div>
+    <label>Driver</label><select name="driverId"><option value="">${slot >= 100 ? '— Remove this extra driver —' : '— No driver —'}</option>${opts}</select>
     <p class="muted small">Later days are re-balanced automatically so duty stays equal.</p>
     <div class="actions"><button value="cancel">Cancel</button><button class="primary" value="ok">Save</button></div>`,
   async (fd) => {
@@ -338,7 +383,7 @@ function adminSchedule(main) {
       if (!rows.length) return `<td class="cell past"><span class="muted small">${past ? '—' : 'not planned'}</span></td>`;
       return `<td class="cell ${past ? 'past' : ''}">${rows.map((a) => {
         const d = a.driverId && driverOf(a.driverId);
-        return `<div ${past ? '' : `data-slot="${esc(day.date)}|${esc(u.id)}|${a.slot}"`}>${d ? `<span class="dname">${esc(d.name)}</span> ${vbadge(d.vehicleType)}${wantNote(u.id, a.slot, d)}${a.manual ? ' <span class="badge manual">✎</span>' : ''}` : '<span class="muted small">— (no free driver)</span>'}</div>`;
+        return `<div ${past ? '' : `data-slot="${esc(day.date)}|${esc(u.id)}|${a.slot}"`}>${d ? `<span class="dname">${esc(d.name)}</span> ${vbadge(d.vehicleType)}${wantNote(u.id, a.slot, d)}${a.extra ? ' <span class="badge warn">extra</span>' : a.manual ? ' <span class="badge manual">✎</span>' : ''}` : '<span class="muted small">— (no free driver)</span>'}</div>`;
       }).join('')}</td>`;
     }).join('');
     return `<tr class="${cls}"><td class="sticky">${esc(fmtDate(day.date))}</td>${cells}</tr>`;

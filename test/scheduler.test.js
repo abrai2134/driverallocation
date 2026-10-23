@@ -154,3 +154,20 @@ test('"1st choice only" slot stays empty rather than take another vehicle', () =
   run(db, '2026-01-01', 3);
   for (const a of db.assignments) if (a.slot === 1) assert.equal(a.driverId, null);
 });
+
+test('emergency extra driver is reserved and survives re-planning', () => {
+  const db = setup(2, ['4W', '4W', '4W', '2W']);
+  run(db, '2026-01-01', 3);
+  const free = S.freeDrivers(db, '2026-01-02');
+  assert.equal(free.length, 2);
+  S.addExtra(db, '2026-01-02', 'u1', free[0].id, { reason: 'rush' });
+  assert.throws(() => S.addExtra(db, '2026-01-02', 'u2', free[0].id));
+  S.replanFrom(db, '2026-01-02', '2026-01-02');
+  const day = db.assignments.filter((a) => a.date === '2026-01-02');
+  const extra = day.find((a) => a.extra);
+  assert.equal(extra.driverId, free[0].id);
+  assert.equal(extra.unitId, 'u1');
+  assert.equal(day.filter((a) => a.driverId === free[0].id).length, 1); // nobody else got them
+  S.setManual(db, '2026-01-02', 'u1', extra.slot, null); // admin removes it
+  assert.ok(!db.assignments.some((a) => a.extra));
+});
