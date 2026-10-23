@@ -250,13 +250,10 @@ function readUnit(body, existing) {
   const vehicleTypes = Array.isArray(body.vehicleTypes) ? body.vehicleTypes.filter((v) => VEHICLE_TYPES.includes(v)) : [];
   let slots;
   if (Array.isArray(body.slots) && body.slots.length) {
-    slots = body.slots.slice(0, S.MAX_SLOTS).map((x) => {
-      const type = VEHICLE_TYPES.includes(x && x.type) ? x.type : 'ANY';
-      return { type, strict: type !== 'ANY' && !!(x && x.strict) };
-    });
+    slots = body.slots.slice(0, S.MAX_SLOTS).map(S.normSlot);
   } else {
     const n = Math.max(1, Math.min(S.MAX_SLOTS, parseInt(body.driversNeeded, 10) || 1));
-    slots = Array.from({ length: n }, () => ({ type: 'ANY', strict: false }));
+    slots = Array.from({ length: n }, () => ({ type: 'ANY', second: 'ANY' }));
   }
   return {
     value: {

@@ -42,15 +42,33 @@ function dayName(d) { return DAYS[dateObj(d).getUTCDay()]; }
 
 function slotSpec(unitId, slot) {
   const u = A().units.find((x) => x.id === unitId);
-  return (u && u.slots && u.slots[slot]) || { type: 'ANY', strict: false };
+  return (u && u.slots && u.slots[slot]) || { type: 'ANY', second: 'ANY' };
 }
 function slotLabel(spec) {
-  return spec.type === 'ANY' ? 'Any vehicle' : `${spec.type}${spec.strict ? ' only' : ' preferred'}`;
+  if (spec.type === 'ANY') return 'Any vehicle';
+  if (spec.second === 'NONE') return `${spec.type} only`;
+  if (spec.second === 'ANY') return `${spec.type}, else any`;
+  return `${spec.type}, else ${spec.second}`;
 }
-// Small note when the driver's vehicle differs from what the slot asked for.
+function slotHtml(spec) {
+  if (spec.type === 'ANY') return '<span class="muted small">Any vehicle</span>';
+  const tail = spec.second === 'NONE' ? ' <span class="small">only</span>' : spec.second === 'ANY' ? ' <span class="small muted">→ any</span>' : ` <span class="small muted">→</span> ${vbadge(spec.second)}`;
+  return vbadge(spec.type) + tail;
+}
+// 0 = 1st choice, 1 = 2nd choice, 2 = other vehicle, -1 = not allowed (same rules as the server).
+function vehicleFit(spec, t) {
+  if (spec.type === 'ANY' || spec.type === t) return 0;
+  if (spec.second === t) return 1;
+  return spec.second === 'ANY' ? 2 : -1;
+}
+// Small note when the driver's vehicle is not the slot's 1st choice.
 function wantNote(unitId, slot, d) {
+  if (!d) return '';
   const spec = slotSpec(unitId, slot);
-  return d && spec.type !== 'ANY' && spec.type !== d.vehicleType ? ` <span class="badge warn">wanted ${esc(spec.type)}</span>` : '';
+  const fit = vehicleFit(spec, d.vehicleType);
+  if (fit === 1) return ' <span class="badge">2nd choice</span>';
+  if (fit === 2) return ` <span class="badge warn">wanted ${esc(spec.type)}</span>`;
+  return '';
 }
 function vbadge(t) { return `<span class="badge ${t === '4W' ? 'w4' : t === '3W' ? 'w3' : 'w2'}">${esc(t)}</span>`; }
 function telLink(phone, label) {
@@ -290,7 +308,7 @@ function changeSlot(date, unitId, slot) {
   const spec = slotSpec(unitId, slot);
   const opts = A().drivers.filter((d) => d.active).map((d) => {
     const leave = onLeaveOn(d.id, date);
-    const wrongVehicle = (types.length && !types.includes(d.vehicleType)) || (spec.strict && spec.type !== d.vehicleType);
+    const wrongVehicle = (types.length && !types.includes(d.vehicleType)) || vehicleFit(spec, d.vehicleType) < 0;
     const where = A().assignments.find((a) => a.date === date && a.driverId === d.id);
     const note = leave ? ' — on leave' : wrongVehicle ? ' — vehicle not allowed' : where && where !== current ? ` — at ${unitName(where.unitId)} (will swap)` : '';
     return `<option value="${esc(d.id)}" ${current && current.driverId === d.id ? 'selected' : ''} ${leave || wrongVehicle ? 'disabled' : ''}>${esc(d.name)} (${esc(d.vehicleType)})${esc(note)}</option>`;
@@ -357,7 +375,7 @@ function adminUnits(main) {
   const rows = A().units.map((u) => `<tr>
     <td><b>${esc(u.name)}</b>${u.address ? `<div class="muted small">${esc(u.address)}</div>` : ''}</td>
     <td>${esc(u.contactName)}<div class="small">${telLink(u.phone)}</div></td>
-    <td>${u.slots.map((sp, i) => `<div class="small">${i + 1}. ${sp.type === 'ANY' ? 'Any' : vbadge(sp.type) + (sp.strict ? ' only' : ' preferred')}</div>`).join('')}</td>
+    <td>${u.slots.map((sp, i) => `<div class="small">${i + 1}. ${slotHtml(sp)}</div>`).join('')}</td>
     <td>${u.vehicleTypes.length ? u.vehicleTypes.map(vbadge).join(' ') : '<span class="muted small">Any</span>'}</td>
     <td><code>${esc(u.username)}</code></td>
     <td>${u.active ? '<span class="badge ok">Active</span>' : '<span class="badge">Inactive</span>'}</td>
@@ -369,7 +387,7 @@ function adminUnits(main) {
 }
 
 function unitForm(u) {
-  const v = u || { name: '', contactName: '', phone: '', address: '', slots: [{ type: 'ANY', strict: false }], vehicleTypes: [], username: '', active: true };
+  const v = u || { name: '', contactName: '', phone: '', address: '', slots: [{ type: '2W', second: 'ANY' }, { type: '4W', second: 'ANY' }], vehicleTypes: [], username: '', active: true };
   openModal(`<h2>${u ? 'Edit unit' : 'Add unit'}</h2>
     <div class="form-grid">
       <div><label>Unit name *</label><input name="name" required value="${esc(v.name)}"></div>
@@ -378,7 +396,7 @@ function unitForm(u) {
     </div>
     <label>Address</label><textarea name="address">${esc(v.address)}</textarea>
     <label>Drivers needed every day</label>
-    <div class="muted small">Driver 1 is the most important. If there are not enough drivers on a day, the last one in this list is left out first.</div>
+    <div class="muted small">Put the must-have drivers first (e.g. Driver 1 = 2W, Driver 2 = 4W). They always get their vehicle first. The 2nd choice is used when no 1st-choice driver is free. If there are not enough drivers, the last driver in this list is left out first.</div>
     <div id="slots"></div>
     <button type="button" id="add-slot" class="link">+ Add another driver</button>
     <label>Vehicle types this unit accepts (for all its drivers)</label>
@@ -400,32 +418,49 @@ function unitForm(u) {
     renderAdmin();
   });
   const slotsEl = document.getElementById('slots');
-  const slotRow = (sp) => `<div class="row slot-row" style="margin:6px 0">
-      <b class="slot-no" style="width:70px"></b>
-      <select class="slot-type" style="width:auto">
-        <option value="ANY" ${sp.type === 'ANY' ? 'selected' : ''}>Any vehicle</option>
-        ${state.pub.vehicleTypes.map((t) => `<option value="${t}" ${sp.type === t ? 'selected' : ''}>${t} – ${VEHICLE_NAMES[t]}</option>`).join('')}
-      </select>
-      <label class="check"><input type="checkbox" class="slot-strict" ${sp.strict ? 'checked' : ''}> Only this type</label>
-      <button type="button" class="link danger slot-del">Remove</button></div>`;
+  const opt = (value, label, cur) => `<option value="${value}" ${cur === value ? 'selected' : ''}>${label}</option>`;
+  const slotRow = (sp) => `<div class="slot-row card" style="margin:8px 0;padding:10px">
+      <div class="row"><b class="slot-no"></b><div class="spacer"></div><button type="button" class="link danger slot-del">Remove</button></div>
+      <div class="form-grid">
+        <div><label>1st choice</label><select class="slot-type">
+          ${opt('ANY', 'Any vehicle', sp.type)}
+          ${state.pub.vehicleTypes.map((t) => opt(t, `${t} – ${VEHICLE_NAMES[t]}`, sp.type)).join('')}
+        </select></div>
+        <div class="second-wrap"><label>2nd choice (if 1st is busy / short)</label><select class="slot-second">
+          ${state.pub.vehicleTypes.map((t) => opt(t, `${t} – ${VEHICLE_NAMES[t]}`, sp.second)).join('')}
+          ${opt('ANY', 'Any other vehicle', sp.second || 'ANY')}
+          ${opt('NONE', 'No other – 1st choice only', sp.second)}
+        </select></div>
+      </div></div>`;
   const renumber = () => slotsEl.querySelectorAll('.slot-row').forEach((r, i, all) => {
     r.querySelector('.slot-no').textContent = 'Driver ' + (i + 1);
     r.querySelector('.slot-del').hidden = all.length === 1;
   });
-  const bindRow = (r) => (r.querySelector('.slot-del').onclick = () => { r.remove(); renumber(); });
-  slotsEl.innerHTML = (v.slots && v.slots.length ? v.slots : [{ type: 'ANY', strict: false }]).map(slotRow).join('');
+  const bindRow = (r) => {
+    r.querySelector('.slot-del').onclick = () => { r.remove(); renumber(); };
+    const type = r.querySelector('.slot-type');
+    const sync = () => {
+      r.querySelector('.second-wrap').hidden = type.value === 'ANY';
+      r.querySelectorAll('.slot-second option').forEach((o) => (o.hidden = o.value === type.value));
+      const sec = r.querySelector('.slot-second');
+      if (sec.value === type.value) sec.value = 'ANY';
+    };
+    type.onchange = sync;
+    sync();
+  };
+  slotsEl.innerHTML = (v.slots && v.slots.length ? v.slots : [{ type: 'ANY', second: 'ANY' }]).map(slotRow).join('');
   slotsEl.querySelectorAll('.slot-row').forEach(bindRow);
   renumber();
   document.getElementById('add-slot').onclick = () => {
     if (slotsEl.children.length >= 10) return;
-    slotsEl.insertAdjacentHTML('beforeend', slotRow({ type: 'ANY', strict: false }));
+    slotsEl.insertAdjacentHTML('beforeend', slotRow({ type: 'ANY', second: 'ANY' }));
     bindRow(slotsEl.lastElementChild);
     renumber();
   };
   function readSlots() {
     return [...slotsEl.querySelectorAll('.slot-row')].map((r) => ({
       type: r.querySelector('.slot-type').value,
-      strict: r.querySelector('.slot-strict').checked,
+      second: r.querySelector('.slot-second').value,
     }));
   }
   const del = document.getElementById('del');

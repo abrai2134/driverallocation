@@ -134,3 +134,23 @@ test('when short of drivers, only the least important slot is left empty', () =>
   const h = S.historyBefore(db, '2099-01-01');
   assert.ok(spread(h.unfilled, db.units.map((u) => u.id)) <= 1); // shortage rotates
 });
+
+test('2nd choice is used before any other vehicle, and must-have slots come first', () => {
+  // 7 drivers, 9 slots. Each unit: 1) 2W else 3W, 2) 4W else any, 3) 3W else any.
+  const db = setup(3, ['2W', '2W', '3W', '4W', '4W', '4W', '4W']);
+  for (const u of db.units) u.slots = [{ type: '2W', second: '3W' }, { type: '4W', second: 'ANY' }, { type: '3W', second: 'ANY' }];
+  run(db, '2026-01-01', 21);
+  const byId = Object.fromEntries(db.drivers.map((d) => [d.id, d]));
+  for (const a of db.assignments) {
+    if (a.slot === 0) assert.ok(a.driverId && ['2W', '3W'].includes(byId[a.driverId].vehicleType));
+    if (a.slot === 1) assert.ok(a.driverId && byId[a.driverId].vehicleType === '4W');
+  }
+  assert.equal(db.assignments.filter((a) => !a.driverId && a.slot !== 2).length, 0);
+});
+
+test('"1st choice only" slot stays empty rather than take another vehicle', () => {
+  const db = setup(1, ['4W', '4W']);
+  db.units[0].slots = [{ type: '4W', second: 'ANY' }, { type: '2W', second: 'NONE' }];
+  run(db, '2026-01-01', 3);
+  for (const a of db.assignments) if (a.slot === 1) assert.equal(a.driverId, null);
+});
