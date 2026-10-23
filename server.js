@@ -129,7 +129,8 @@ function unitView(u) {
     contactName: u.contactName || '',
     phone: u.phone || '',
     address: u.address || '',
-    driversNeeded: u.driversNeeded || 1,
+    driversNeeded: S.unitSlots(u).length,
+    slots: S.unitSlots(u),
     vehicleTypes: u.vehicleTypes || [],
     username: u.username || '',
     active: !!u.active,
@@ -167,7 +168,7 @@ app.get('/api/unit/home', need('unit'), (req, res) => {
   const days = range(t, addDays(t, 6)).map((date) => ({
     ...dayInfo(date),
     drivers: db()
-      .assignments.filter((a) => a.date === date && a.unitId === u.id)
+      .assignments.filter((a) => a.date === date && a.unitId === u.id && a.driverId)
       .map((a) => driverView(db().drivers.find((d) => d.id === a.driverId))),
   }));
   res.json({ today: t, unit: unitView(u), days });
@@ -247,6 +248,16 @@ function readUnit(body, existing) {
   if (!existing && password.length < 4) return { error: 'Password must be at least 4 characters' };
   if (existing && password && password.length < 4) return { error: 'Password must be at least 4 characters' };
   const vehicleTypes = Array.isArray(body.vehicleTypes) ? body.vehicleTypes.filter((v) => VEHICLE_TYPES.includes(v)) : [];
+  let slots;
+  if (Array.isArray(body.slots) && body.slots.length) {
+    slots = body.slots.slice(0, S.MAX_SLOTS).map((x) => {
+      const type = VEHICLE_TYPES.includes(x && x.type) ? x.type : 'ANY';
+      return { type, strict: type !== 'ANY' && !!(x && x.strict) };
+    });
+  } else {
+    const n = Math.max(1, Math.min(S.MAX_SLOTS, parseInt(body.driversNeeded, 10) || 1));
+    slots = Array.from({ length: n }, () => ({ type: 'ANY', strict: false }));
+  }
   return {
     value: {
       name,
@@ -254,7 +265,8 @@ function readUnit(body, existing) {
       contactName: str(body.contactName, 80),
       phone: str(body.phone, 30),
       address: str(body.address, 300),
-      driversNeeded: Math.max(1, Math.min(10, parseInt(body.driversNeeded, 10) || 1)),
+      driversNeeded: slots.length,
+      slots,
       vehicleTypes,
       active: body.active !== false,
     },
@@ -370,7 +382,7 @@ admin.post('/assign', (req, res) => {
     if (!d) return bad(res, 'Driver not available');
     if (S.onLeave(db(), driverId, date)) return bad(res, `${d.name} is on leave that day`);
     const u = db().units.find((x) => x.id === unitId);
-    if (u && !S.canServe(d, u)) return bad(res, `${u.name} does not accept ${d.vehicleType} vehicles`);
+    if (u && !S.canServe(d, u, slot)) return bad(res, `This ${u.name} slot does not accept ${d.vehicleType} vehicles`);
   }
   try {
     S.setManual(db(), date, unitId, slot, driverId);

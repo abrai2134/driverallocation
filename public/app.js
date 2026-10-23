@@ -40,6 +40,18 @@ function fmtDate(d, opts = { weekday: 'short', day: 'numeric', month: 'short' })
 function addDays(d, n) { const x = dateObj(d); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); }
 function dayName(d) { return DAYS[dateObj(d).getUTCDay()]; }
 
+function slotSpec(unitId, slot) {
+  const u = A().units.find((x) => x.id === unitId);
+  return (u && u.slots && u.slots[slot]) || { type: 'ANY', strict: false };
+}
+function slotLabel(spec) {
+  return spec.type === 'ANY' ? 'Any vehicle' : `${spec.type}${spec.strict ? ' only' : ' preferred'}`;
+}
+// Small note when the driver's vehicle differs from what the slot asked for.
+function wantNote(unitId, slot, d) {
+  const spec = slotSpec(unitId, slot);
+  return d && spec.type !== 'ANY' && spec.type !== d.vehicleType ? ` <span class="badge warn">wanted ${esc(spec.type)}</span>` : '';
+}
 function vbadge(t) { return `<span class="badge ${t === '4W' ? 'w4' : t === '3W' ? 'w3' : 'w2'}">${esc(t)}</span>`; }
 function telLink(phone, label) {
   if (!phone) return '';
@@ -156,7 +168,7 @@ async function renderUnit() {
     ? `<div class="hero off"><div class="label">Today · ${esc(fmtDate(first.date))}</div><div class="big">Holiday / off day</div><div class="line">No deliveries scheduled.</div></div>`
     : `<div class="hero"><div class="label">Your driver today · ${esc(fmtDate(first.date))}</div>${first.drivers.map(driverBlock).join('') || driverBlock(null)}</div>`;
   const list = rest.map((d) => `<div class="day"><div class="date">${esc(dayName(d.date))}<small>${esc(fmtDate(d.date, { day: 'numeric', month: 'short' }))}</small></div>
-    <div>${!d.working ? '<span class="muted">Off day</span>' : d.drivers.map((x) => x ? `<div><b>${esc(x.name)}</b> ${vbadge(x.vehicleType)} ${telLink(x.phone)}</div>` : '<div class="empty">Not assigned</div>').join('')}</div></div>`).join('');
+    <div>${!d.working ? '<span class="muted">Off day</span>' : (d.drivers.map((x) => `<div><b>${esc(x.name)}</b> ${vbadge(x.vehicleType)} ${telLink(x.phone)}</div>`).join('') || '<div class="empty">Not assigned</div>')}</div></div>`).join('');
   $app.querySelector('.wrap').innerHTML = `${hero}<div class="card"><h2>Next days</h2><div class="daylist">${list}</div></div>`;
 }
 
@@ -246,13 +258,13 @@ function adminToday(main) {
     const rows = todays.filter((a) => a.unitId === u.id);
     const inner = rows.map((a) => {
       const d = a.driverId && driverOf(a.driverId);
-      return `<div class="drv">${d ? `<b>${esc(d.name)}</b> ${vbadge(d.vehicleType)} ${a.manual ? '<span class="badge manual">changed</span>' : ''}<div class="small">${telLink(d.phone)} ${d.vehicleNo ? '· ' + esc(d.vehicleNo) : ''}</div>` : '<span class="empty">No driver</span>'}
+      return `<div class="drv">${d ? `<b>${esc(d.name)}</b> ${vbadge(d.vehicleType)}${wantNote(a.unitId, a.slot, d)} ${a.manual ? '<span class="badge manual">changed</span>' : ''}<div class="small">${telLink(d.phone)} ${d.vehicleNo ? '· ' + esc(d.vehicleNo) : ''}</div>` : `<span class="muted">Extra driver ${a.slot + 1} (${esc(slotLabel(slotSpec(a.unitId, a.slot)))}) – no free driver today</span>`}
         <div><button class="link small" data-change="${esc(a.unitId)}|${a.slot}">Change</button></div></div>`;
     }).join('');
     return `<div class="card unit-card"><div class="name">${esc(u.name)}</div>${u.contactName ? `<div class="muted small">${esc(u.contactName)} ${telLink(u.phone)}</div>` : ''}${inner}</div>`;
   }).join('');
   main.innerHTML = `<div class="row section"><div><h1>Today · ${esc(fmtDate(t, { weekday: 'long', day: 'numeric', month: 'long' }))}</h1>
-      <div class="muted">${day && day.working ? `${todays.filter((a) => a.driverId).length} of ${todays.length} slots filled` : 'Off day / holiday — no allocation'}</div></div>
+      <div class="muted">${day && day.working ? `${todays.filter((a) => a.driverId).length} of ${todays.length} slots filled${todays.some((a) => !a.driverId) ? ` – ${A().drivers.filter((d) => d.active && !onLeaveOn(d.id, t)).length} drivers available. Add a driver or reduce drivers needed in Units to fill every slot.` : ''}` : 'Off day / holiday — no allocation'}</div></div>
       <div class="spacer"></div>
       ${day && day.working ? '<button id="wa">📤 Share on WhatsApp</button>' : ''}</div>
     ${day && day.working ? `<div class="grid">${cards}</div>
@@ -264,7 +276,7 @@ function adminToday(main) {
     for (const u of units) {
       for (const a of todays.filter((x) => x.unitId === u.id)) {
         const d = a.driverId && driverOf(a.driverId);
-        lines.push(`• ${u.name}: ${d ? `${d.name} (${d.vehicleType}${d.phone ? ', ' + d.phone : ''})` : 'NO DRIVER'}`);
+        if (d) lines.push(`• ${u.name}: ${d.name} (${d.vehicleType}${d.phone ? ', ' + d.phone : ''})`);
       }
     }
     window.open('https://wa.me/?text=' + encodeURIComponent(lines.join('\n')), '_blank');
@@ -275,14 +287,15 @@ function changeSlot(date, unitId, slot) {
   const current = A().assignments.find((a) => a.date === date && a.unitId === unitId && a.slot === slot);
   const unit = A().units.find((u) => u.id === unitId);
   const types = (unit && unit.vehicleTypes) || [];
+  const spec = slotSpec(unitId, slot);
   const opts = A().drivers.filter((d) => d.active).map((d) => {
     const leave = onLeaveOn(d.id, date);
-    const wrongVehicle = types.length && !types.includes(d.vehicleType);
+    const wrongVehicle = (types.length && !types.includes(d.vehicleType)) || (spec.strict && spec.type !== d.vehicleType);
     const where = A().assignments.find((a) => a.date === date && a.driverId === d.id);
     const note = leave ? ' — on leave' : wrongVehicle ? ' — vehicle not allowed' : where && where !== current ? ` — at ${unitName(where.unitId)} (will swap)` : '';
     return `<option value="${esc(d.id)}" ${current && current.driverId === d.id ? 'selected' : ''} ${leave || wrongVehicle ? 'disabled' : ''}>${esc(d.name)} (${esc(d.vehicleType)})${esc(note)}</option>`;
   }).join('');
-  openModal(`<h2>Change driver</h2><div class="muted">${esc(unitName(unitId))} · ${esc(fmtDate(date))}</div>
+  openModal(`<h2>Change driver</h2><div class="muted">${esc(unitName(unitId))} · driver ${slot + 1} (${esc(slotLabel(spec))}) · ${esc(fmtDate(date))}</div>
     <label>Driver</label><select name="driverId"><option value="">— No driver —</option>${opts}</select>
     <p class="muted small">Later days are re-balanced automatically so duty stays equal.</p>
     <div class="actions"><button value="cancel">Cancel</button><button class="primary" value="ok">Save</button></div>`,
@@ -307,7 +320,7 @@ function adminSchedule(main) {
       if (!rows.length) return `<td class="cell past"><span class="muted small">${past ? '—' : 'not planned'}</span></td>`;
       return `<td class="cell ${past ? 'past' : ''}">${rows.map((a) => {
         const d = a.driverId && driverOf(a.driverId);
-        return `<div ${past ? '' : `data-slot="${esc(day.date)}|${esc(u.id)}|${a.slot}"`}>${d ? `<span class="dname">${esc(d.name)}</span> ${vbadge(d.vehicleType)}${a.manual ? ' <span class="badge manual">✎</span>' : ''}` : '<span class="empty">none</span>'}</div>`;
+        return `<div ${past ? '' : `data-slot="${esc(day.date)}|${esc(u.id)}|${a.slot}"`}>${d ? `<span class="dname">${esc(d.name)}</span> ${vbadge(d.vehicleType)}${wantNote(u.id, a.slot, d)}${a.manual ? ' <span class="badge manual">✎</span>' : ''}` : '<span class="muted small">— (no free driver)</span>'}</div>`;
       }).join('')}</td>`;
     }).join('');
     return `<tr class="${cls}"><td class="sticky">${esc(fmtDate(day.date))}</td>${cells}</tr>`;
@@ -344,28 +357,31 @@ function adminUnits(main) {
   const rows = A().units.map((u) => `<tr>
     <td><b>${esc(u.name)}</b>${u.address ? `<div class="muted small">${esc(u.address)}</div>` : ''}</td>
     <td>${esc(u.contactName)}<div class="small">${telLink(u.phone)}</div></td>
-    <td class="num">${u.driversNeeded}</td>
+    <td>${u.slots.map((sp, i) => `<div class="small">${i + 1}. ${sp.type === 'ANY' ? 'Any' : vbadge(sp.type) + (sp.strict ? ' only' : ' preferred')}</div>`).join('')}</td>
     <td>${u.vehicleTypes.length ? u.vehicleTypes.map(vbadge).join(' ') : '<span class="muted small">Any</span>'}</td>
     <td><code>${esc(u.username)}</code></td>
     <td>${u.active ? '<span class="badge ok">Active</span>' : '<span class="badge">Inactive</span>'}</td>
     <td><button class="link" data-edit="${esc(u.id)}">Edit</button></td></tr>`).join('');
   main.innerHTML = `<div class="row section"><h1>Units</h1><div class="spacer"></div><button class="primary" id="add">+ Add unit</button></div>
-    ${A().units.length ? `<div class="table-wrap"><table><thead><tr><th>Unit</th><th>Contact</th><th class="num">Drivers / day</th><th>Vehicles</th><th>Login ID</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="card muted">No units yet. Add your first unit.</div>'}`;
+    ${A().units.length ? `<div class="table-wrap"><table><thead><tr><th>Unit</th><th>Contact</th><th>Drivers needed (in priority order)</th><th>Allowed vehicles</th><th>Login ID</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="card muted">No units yet. Add your first unit.</div>'}`;
   document.getElementById('add').onclick = () => unitForm();
   main.querySelectorAll('[data-edit]').forEach((b) => (b.onclick = () => unitForm(A().units.find((u) => u.id === b.dataset.edit))));
 }
 
 function unitForm(u) {
-  const v = u || { name: '', contactName: '', phone: '', address: '', driversNeeded: 1, vehicleTypes: [], username: '', active: true };
+  const v = u || { name: '', contactName: '', phone: '', address: '', slots: [{ type: 'ANY', strict: false }], vehicleTypes: [], username: '', active: true };
   openModal(`<h2>${u ? 'Edit unit' : 'Add unit'}</h2>
     <div class="form-grid">
       <div><label>Unit name *</label><input name="name" required value="${esc(v.name)}"></div>
-      <div><label>Drivers needed per day</label><input name="driversNeeded" type="number" min="1" max="10" value="${esc(v.driversNeeded)}"></div>
       <div><label>Contact person</label><input name="contactName" value="${esc(v.contactName)}"></div>
       <div><label>Phone</label><input name="phone" type="tel" value="${esc(v.phone)}"></div>
     </div>
     <label>Address</label><textarea name="address">${esc(v.address)}</textarea>
-    <label>Vehicle types this unit accepts</label>
+    <label>Drivers needed every day</label>
+    <div class="muted small">Driver 1 is the most important. If there are not enough drivers on a day, the last one in this list is left out first.</div>
+    <div id="slots"></div>
+    <button type="button" id="add-slot" class="link">+ Add another driver</button>
+    <label>Vehicle types this unit accepts (for all its drivers)</label>
     <div>${state.pub.vehicleTypes.map((t) => `<label class="check"><input type="checkbox" name="vt" value="${t}" ${v.vehicleTypes.includes(t) ? 'checked' : ''}> ${t} ${VEHICLE_NAMES[t]}</label>`).join('')}</div>
     <div class="muted small">Leave all unticked to accept any vehicle.</div>
     <div class="form-grid">
@@ -377,12 +393,41 @@ function unitForm(u) {
   async (fd) => {
     const body = {
       name: fd.get('name'), driversNeeded: fd.get('driversNeeded'), contactName: fd.get('contactName'), phone: fd.get('phone'),
-      address: fd.get('address'), vehicleTypes: fd.getAll('vt'), username: fd.get('username'), password: fd.get('password'), active: fd.get('active') === 'on',
+      address: fd.get('address'), vehicleTypes: fd.getAll('vt'), slots: readSlots(), username: fd.get('username'), password: fd.get('password'), active: fd.get('active') === 'on',
     };
     await api(u ? `/admin/units/${u.id}` : '/admin/units', { method: u ? 'PUT' : 'POST', body });
     toast(u ? 'Unit updated' : 'Unit added – schedule updated');
     renderAdmin();
   });
+  const slotsEl = document.getElementById('slots');
+  const slotRow = (sp) => `<div class="row slot-row" style="margin:6px 0">
+      <b class="slot-no" style="width:70px"></b>
+      <select class="slot-type" style="width:auto">
+        <option value="ANY" ${sp.type === 'ANY' ? 'selected' : ''}>Any vehicle</option>
+        ${state.pub.vehicleTypes.map((t) => `<option value="${t}" ${sp.type === t ? 'selected' : ''}>${t} – ${VEHICLE_NAMES[t]}</option>`).join('')}
+      </select>
+      <label class="check"><input type="checkbox" class="slot-strict" ${sp.strict ? 'checked' : ''}> Only this type</label>
+      <button type="button" class="link danger slot-del">Remove</button></div>`;
+  const renumber = () => slotsEl.querySelectorAll('.slot-row').forEach((r, i, all) => {
+    r.querySelector('.slot-no').textContent = 'Driver ' + (i + 1);
+    r.querySelector('.slot-del').hidden = all.length === 1;
+  });
+  const bindRow = (r) => (r.querySelector('.slot-del').onclick = () => { r.remove(); renumber(); });
+  slotsEl.innerHTML = (v.slots && v.slots.length ? v.slots : [{ type: 'ANY', strict: false }]).map(slotRow).join('');
+  slotsEl.querySelectorAll('.slot-row').forEach(bindRow);
+  renumber();
+  document.getElementById('add-slot').onclick = () => {
+    if (slotsEl.children.length >= 10) return;
+    slotsEl.insertAdjacentHTML('beforeend', slotRow({ type: 'ANY', strict: false }));
+    bindRow(slotsEl.lastElementChild);
+    renumber();
+  };
+  function readSlots() {
+    return [...slotsEl.querySelectorAll('.slot-row')].map((r) => ({
+      type: r.querySelector('.slot-type').value,
+      strict: r.querySelector('.slot-strict').checked,
+    }));
+  }
   const del = document.getElementById('del');
   if (del) del.onclick = async () => {
     if (!confirm(`Remove ${u.name}? Past history is kept.`)) return;

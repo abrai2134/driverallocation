@@ -5,7 +5,8 @@ A small website that **automatically decides which driver serves which unit each
 - **Equal duty** – the drivers with the fewest duties so far always get the next ones.
 - **Rotation** – each driver is sent to the units they have visited least, so everyone covers every unit.
 - **No back-to-back repeats** – a driver avoids the same unit two working days in a row.
-- **Vehicle rules** – a unit can accept only certain vehicles (4W / 3W / 2W).
+- **Vehicle needs per driver** – each unit lists the drivers it needs in priority order, each with a preferred (or required) vehicle type, e.g. driver 1 = 2W, driver 2 = 4W, driver 3 = 3W. A preferred type is matched whenever possible; otherwise another vehicle is sent rather than leaving the slot empty.
+- **Shortage handling** – if there are more slots than drivers, only the least important slot (the last one in a unit's list) is left empty, and that shortage rotates between units.
 - **Leave** – mark a driver absent; today only their slot is filled with a free driver, and the following days are re-balanced.
 - **New units / drivers** – add them any time. A new driver starts level with the others, so they don't get extra days to "catch up".
 - Plans **14 days ahead** automatically (changeable), skips weekly off days and holidays.

@@ -98,3 +98,39 @@ test('manual change swaps drivers on the same day', () => {
   assert.equal(a.driverId, dbb);
   assert.equal(b.driverId, da);
 });
+
+test('slot vehicle preferences are matched when the drivers exist', () => {
+  const db = setup(3, ['2W', '2W', '2W', '3W', '3W', '3W', '4W', '4W', '4W']);
+  for (const u of db.units) u.slots = [{ type: '2W' }, { type: '3W' }, { type: '4W' }];
+  run(db, '2026-01-01', 20);
+  const byId = Object.fromEntries(db.drivers.map((d) => [d.id, d]));
+  for (const a of db.assignments) {
+    const want = db.units.find((u) => u.id === a.unitId).slots[a.slot].type;
+    assert.equal(byId[a.driverId].vehicleType, want);
+  }
+});
+
+test('a preferred slot uses another vehicle instead of staying empty', () => {
+  const db = setup(1, ['4W', '4W']);
+  db.units[0].slots = [{ type: '2W' }, { type: '4W' }];
+  run(db, '2026-01-01', 3);
+  assert.ok(db.assignments.every((a) => a.driverId));
+});
+
+test('a strict slot is never given the wrong vehicle', () => {
+  const db = setup(1, ['4W', '4W']);
+  db.units[0].slots = [{ type: '4W' }, { type: '2W', strict: true }];
+  run(db, '2026-01-01', 3);
+  for (const a of db.assignments) if (a.slot === 1) assert.equal(a.driverId, null);
+});
+
+test('when short of drivers, only the least important slot is left empty', () => {
+  const db = setup(3, ['2W', '2W', '2W', '3W', '3W', '4W', '4W', '4W']); // 8 drivers, 9 slots
+  for (const u of db.units) u.slots = [{ type: '2W' }, { type: '4W' }, { type: '3W' }];
+  run(db, '2026-01-01', 30);
+  const empty = db.assignments.filter((a) => !a.driverId);
+  assert.equal(empty.length, 30); // exactly one per day
+  assert.ok(empty.every((a) => a.slot === 2)); // always the last slot
+  const h = S.historyBefore(db, '2099-01-01');
+  assert.ok(spread(h.unfilled, db.units.map((u) => u.id)) <= 1); // shortage rotates
+});
