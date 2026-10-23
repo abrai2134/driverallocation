@@ -184,8 +184,12 @@ async function renderUnit() {
         <div class="line">${esc(VEHICLE_NAMES[d.vehicleType] || d.vehicleType)}${d.vehicleNo ? ' · ' + esc(d.vehicleNo) : ''}${d.reason ? ' · ' + esc(d.reason) : ''}</div>
         <div class="row">${d.phone ? `<a class="call" href="tel:${esc(d.phone.replace(/[^\d+]/g, ''))}">📞 Call ${esc(d.phone)}</a>` : ''} ${cancelBtn(first.date, d)}</div></div>`
     : `<div class="person"><div class="big">No driver available</div><div class="line">Please contact the admin.</div></div>`;
-  const others = (day) => day.otherExtras.length
-    ? `<div class="muted small" style="margin-top:4px">Emergency: ${day.otherExtras.map((o) => `${esc(o.driver)} → ${esc(o.unit)}`).join(', ')}</div>` : '';
+  const others = (day) => {
+    const lost = day.otherExtras.filter((o) => o.fromMe);
+    const rest = day.otherExtras.filter((o) => !o.fromMe);
+    return (lost.length ? `<div class="badge bad" style="margin-top:6px;white-space:normal">⚠ ${lost.map((o) => `${esc(o.driver)} was taken by ${esc(o.unit)} for an emergency`).join('; ')}</div>` : '') +
+      (rest.length ? `<div class="muted small" style="margin-top:4px">Emergency: ${rest.map((o) => `${esc(o.driver)} → ${esc(o.unit)}`).join(', ')}</div>` : '');
+  };
   const hero = !first.working && !first.drivers.length
     ? `<div class="hero off"><div class="label">Today · ${esc(fmtDate(first.date))}</div><div class="big">Holiday / off day</div><div class="line">No deliveries scheduled.</div></div>`
     : `<div class="hero"><div class="label">Your driver today · ${esc(fmtDate(first.date))}</div>${first.drivers.map(driverBlock).join('') || driverBlock(null)}</div>`;
@@ -193,7 +197,7 @@ async function renderUnit() {
     <div>${!d.working && !d.drivers.length ? '<span class="muted">Off day</span>' : (d.drivers.map((x) => `<div><b>${esc(x.name)}</b> ${vbadge(x.vehicleType)}${extraBadge(x)} ${telLink(x.phone)} ${cancelBtn(d.date, x)}</div>`).join('') || '<div class="empty">Not assigned</div>')}${others(d)}</div></div>`).join('');
   $app.querySelector('.wrap').innerHTML = `${hero}
     <div class="card section"><div class="row"><div><h2 style="margin:0">Need one more driver?</h2>
-      <div class="muted small">For a shortage or emergency. Only drivers who are free that day are shown; once you take one, no other unit gets them.</div></div>
+      <div class="muted small">For a shortage or emergency. Pick any driver: a free driver is best. If you pick a driver working at another unit, they move to you and that unit is told.</div></div>
       <div class="spacer"></div><button class="primary" id="need-extra">+ Ask for an emergency driver</button></div>
       ${others(first) ? `<div style="margin-top:8px"><b class="small">Today</b>${others(first)}</div>` : ''}</div>
     <div class="card"><h2>Next days</h2><div class="daylist">${list}</div></div>`;
@@ -209,12 +213,14 @@ function askExtra(data) {
   const dayOpts = data.days.map((d, i) => `<option value="${esc(d.date)}">${i === 0 ? 'Today' : esc(dayName(d.date))} – ${esc(fmtDate(d.date, { day: 'numeric', month: 'short' }))}</option>`).join('');
   openModal(`<h2>Ask for an emergency driver</h2>
     <label>Day</label><select name="date" id="x-date">${dayOpts}</select>
-    <label>Free driver</label><div id="x-list" class="muted">Loading…</div>
+    <label>Driver</label><div id="x-list" class="muted">Loading…</div>
     <label>Reason (optional)</label><input name="reason" placeholder="e.g. extra delivery, driver busy">
     <div class="actions"><button value="cancel">Cancel</button><button class="primary" value="ok" id="x-ok">Take this driver</button></div>`,
   async (fd) => {
     const driverId = fd.get('driverId');
-    if (!driverId) throw new Error('Choose a free driver');
+    if (!driverId) throw new Error('Choose a driver');
+    const opt = document.querySelector('#x-driver option:checked');
+    if (opt && opt.dataset.at && !confirm(`${opt.dataset.name} is working at ${opt.dataset.at}. Move them to you? ${opt.dataset.at} will be told.`)) throw new Error('Not moved');
     await api('/unit/extra', { method: 'POST', body: { date: fd.get('date'), driverId, reason: fd.get('reason') } });
     toast('Driver reserved for you');
     renderUnit();
@@ -225,10 +231,29 @@ function askExtra(data) {
     box.innerHTML = 'Loading…';
     try {
       const r = await api('/unit/free?date=' + document.getElementById('x-date').value);
-      ok.disabled = !r.drivers.length;
+      const note = { free: 'free', other: 'now at ', emergency: 'emergency at ', mine: 'already with you' };
+      const usable = r.drivers.filter((d) => d.status === 'free' || d.status === 'other');
+      ok.disabled = !usable.length;
+      const freeCount = r.drivers.filter((d) => d.status === 'free').length;
       box.innerHTML = r.drivers.length
-        ? r.drivers.map((d, i) => `<label class="check" style="display:flex;margin:6px 0"><input type="radio" name="driverId" value="${esc(d.id)}" ${i === 0 ? 'checked' : ''}> <b>${esc(d.name)}</b> ${vbadge(d.vehicleType)} <span class="small muted">${esc(d.phone)}</span></label>`).join('')
-        : '<div class="error">No driver is free that day – every driver is already working. Please call the admin.</div>';
+        ? `<select name="driverId" id="x-driver">
+            ${r.drivers.map((d) => {
+              const can = d.status === 'free' || d.status === 'other';
+              const where = d.status === 'other' || d.status === 'emergency' ? note[d.status] + d.at : note[d.status];
+              return `<option value="${esc(d.id)}" ${can ? '' : 'disabled'} data-name="${esc(d.name)}" data-at="${d.status === 'other' ? esc(d.at) : ''}">${esc(d.name)} (${esc(d.vehicleType)}) – ${esc(where)}</option>`;
+            }).join('')}
+          </select>
+          <div class="small ${freeCount ? 'muted' : ''}" id="x-hint" style="margin-top:6px"></div>`
+        : '<div class="error">No driver is available that day (all inactive or on leave). Please call the admin.</div>';
+      const sel = document.getElementById('x-driver');
+      const hint = document.getElementById('x-hint');
+      const sync = () => {
+        const o = sel.options[sel.selectedIndex];
+        hint.innerHTML = o && o.dataset.at
+          ? `<span class="badge warn" style="white-space:normal">${esc(o.dataset.name)} will move from ${esc(o.dataset.at)} to you. ${esc(o.dataset.at)} will see this.</span>`
+          : freeCount ? `${freeCount} free driver(s) at the top of the list.` : '';
+      };
+      if (sel) { sel.onchange = sync; sync(); }
     } catch (ex) { box.innerHTML = `<div class="error">${esc(ex.message)}</div>`; }
   };
   document.getElementById('x-date').onchange = load;
@@ -321,7 +346,7 @@ function adminToday(main) {
     const rows = todays.filter((a) => a.unitId === u.id);
     const inner = rows.map((a) => {
       const d = a.driverId && driverOf(a.driverId);
-      return `<div class="drv">${d ? `<b>${esc(d.name)}</b> ${vbadge(d.vehicleType)}${wantNote(a.unitId, a.slot, d)} ${a.extra ? `<span class="badge warn">emergency extra</span>${a.reason ? ` <span class="small muted">${esc(a.reason)}</span>` : ''}` : a.manual ? '<span class="badge manual">changed</span>' : ''}<div class="small">${telLink(d.phone)} ${d.vehicleNo ? '· ' + esc(d.vehicleNo) : ''}</div>` : `<span class="muted">Extra driver ${a.slot + 1} (${esc(slotLabel(slotSpec(a.unitId, a.slot)))}) – no free driver today</span>`}
+      return `<div class="drv">${d ? `<b>${esc(d.name)}</b> ${vbadge(d.vehicleType)}${wantNote(a.unitId, a.slot, d)} ${a.extra ? `<span class="badge warn">emergency extra</span>${a.fromUnitId ? ` <span class="small muted">moved from ${esc(unitName(a.fromUnitId))}</span>` : ''}${a.reason ? ` <span class="small muted">${esc(a.reason)}</span>` : ''}` : a.manual ? '<span class="badge manual">changed</span>' : ''}<div class="small">${telLink(d.phone)} ${d.vehicleNo ? '· ' + esc(d.vehicleNo) : ''}</div>` : `<span class="muted">Driver ${a.slot + 1} (${esc(slotLabel(slotSpec(a.unitId, a.slot)))}) – ${todays.some((x) => x.extra && x.fromUnitId === a.unitId) ? `driver moved to ${esc(todays.filter((x) => x.extra && x.fromUnitId === a.unitId).map((x) => unitName(x.unitId)).join(', '))} for an emergency` : 'no free driver today'}</span>`}
         <div><button class="link small" data-change="${esc(a.unitId)}|${a.slot}">Change</button></div></div>`;
     }).join('');
     return `<div class="card unit-card"><div class="name">${esc(u.name)}</div>${u.contactName ? `<div class="muted small">${esc(u.contactName)} ${telLink(u.phone)}</div>` : ''}${inner}</div>`;

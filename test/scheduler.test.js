@@ -171,3 +171,21 @@ test('emergency extra driver is reserved and survives re-planning', () => {
   S.setManual(db, '2026-01-02', 'u1', extra.slot, null); // admin removes it
   assert.ok(!db.assignments.some((a) => a.extra));
 });
+
+test('unit can take a busy driver: they move, and are never in two places', () => {
+  const db = setup(2, ['4W', '4W']); // both drivers busy
+  run(db, '2026-01-01', 2);
+  const taken = db.assignments.find((a) => a.date === '2026-01-02' && a.unitId === 'u2');
+  const drv = taken.driverId;
+  S.addExtra(db, '2026-01-02', 'u1', drv, {});
+  S.repairDay(db, '2026-01-02');
+  const day = db.assignments.filter((a) => a.date === '2026-01-02' && a.driverId === drv);
+  assert.equal(day.length, 1);
+  assert.equal(day[0].unitId, 'u1');
+  assert.equal(day[0].fromUnitId, 'u2');
+  assert.throws(() => S.addExtra(db, '2026-01-02', 'u2', drv, {})); // can't grab back an emergency driver
+  // cancelling sends the driver back
+  db.assignments = db.assignments.filter((a) => !a.extra);
+  S.repairDay(db, '2026-01-02');
+  assert.equal(db.assignments.find((a) => a.date === '2026-01-02' && a.driverId === drv).unitId, 'u2');
+});

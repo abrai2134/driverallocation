@@ -157,7 +157,7 @@ function dayInfo(date) {
 function assignmentsBetween(from, to) {
   return db()
     .assignments.filter((a) => a.date >= from && a.date <= to)
-    .map((a) => ({ date: a.date, unitId: a.unitId, slot: a.slot, driverId: a.driverId, manual: !!a.manual, extra: !!a.extra, reason: a.reason || '' }));
+    .map((a) => ({ date: a.date, unitId: a.unitId, slot: a.slot, driverId: a.driverId, manual: !!a.manual, extra: !!a.extra, reason: a.reason || '', fromUnitId: a.fromUnitId || null }));
 }
 
 // ---------- unit login ----------
@@ -173,7 +173,7 @@ app.get('/api/unit/home', need('unit'), (req, res) => {
     // Emergency drivers other units took that day, so everyone knows where they are.
     otherExtras: db()
       .assignments.filter((a) => a.date === date && a.extra && a.driverId && a.unitId !== u.id)
-      .map((a) => ({ driver: (db().drivers.find((d) => d.id === a.driverId) || {}).name, unit: (db().units.find((x) => x.id === a.unitId) || {}).name })),
+      .map((a) => ({ driver: (db().drivers.find((d) => d.id === a.driverId) || {}).name, unit: (db().units.find((x) => x.id === a.unitId) || {}).name, fromMe: a.fromUnitId === u.id })),
   }));
   res.json({ today: t, unit: unitView(u), days });
 });
@@ -192,7 +192,12 @@ app.get('/api/unit/free', need('unit'), (req, res) => {
   plan();
   const date = unitDate(req, res);
   if (!date) return;
-  res.json({ date, drivers: S.freeDrivers(db(), date).map(driverView) });
+  const name = (id) => (db().units.find((x) => x.id === id) || {}).name || '';
+  const order = { free: 0, other: 1, emergency: 2, mine: 3 };
+  const drivers = S.driverStatus(db(), date, req.user.id)
+    .sort((a, b) => order[a.status] - order[b.status] || a.driver.name.localeCompare(b.driver.name))
+    .map((x) => ({ ...driverView(x.driver), status: x.status, at: name(x.unitId) }));
+  res.json({ date, drivers });
 });
 
 app.post('/api/unit/extra', need('unit'), (req, res) => {
@@ -205,6 +210,7 @@ app.post('/api/unit/extra', need('unit'), (req, res) => {
   } catch (e) {
     return bad(res, e.message);
   }
+  S.repairDay(db(), date); // refill the slot the driver left, if anyone is free
   S.replanFrom(db(), addDays(date, 1), today()); // keep duty equal on the following days
   store.save();
   res.json({ ok: true });
@@ -218,6 +224,7 @@ app.post('/api/unit/extra/cancel', need('unit'), (req, res) => {
   const before = db().assignments.length;
   db().assignments = db().assignments.filter((a) => !(a.date === date && a.unitId === u.id && a.extra && a.slot === slot));
   if (db().assignments.length === before) return bad(res, 'Nothing to cancel');
+  S.repairDay(db(), date); // the driver is free again and can go back
   S.replanFrom(db(), addDays(date, 1), today());
   store.save();
   res.json({ ok: true });

@@ -7,7 +7,7 @@ A small website that **automatically decides which driver serves which unit each
 - **No back-to-back repeats** – a driver avoids the same unit two working days in a row.
 - **Vehicle needs per driver** – each unit lists the drivers it needs in priority order. Every driver slot has a **1st choice** vehicle (2W/3W/4W/any) and a **2nd choice** used when no 1st-choice driver is free (another type, any other vehicle, or none). Must-have slots (e.g. 1 = 2W, 2 = 4W) are filled with the right vehicle before less important ones.
 - **Shortage handling** – if there are more slots than drivers, only the least important slot (the last one in a unit's list) is left empty, and that shortage rotates between units.
-- **Emergency driver** – a unit can ask for one more driver for today (or up to 6 days ahead). Only free drivers are offered; once taken, that driver is reserved for that unit, and the other units, the driver and the admin all see it.
+- **Emergency driver** – a unit can ask for one more driver for today (or up to 6 days ahead), choosing from all drivers. Free drivers are listed first; a driver working at another unit can be moved, and that unit is told. A driver is never in two places, and the admin and driver see the change.
 - **Leave** – mark a driver absent; today only their slot is filled with a free driver, and the following days are re-balanced.
 - **New units / drivers** – add them any time. A new driver starts level with the others, so they don't get extra days to "catch up".
 - Plans **14 days ahead** automatically (changeable), skips weekly off days and holidays.
