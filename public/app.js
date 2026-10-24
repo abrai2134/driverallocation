@@ -200,6 +200,7 @@ async function renderUnit() {
       <div class="muted small">For a shortage or emergency. Pick any driver: a free driver is best. If you pick a driver working at another unit, they move to you and that unit is told.</div></div>
       <div class="spacer"></div><button class="primary" id="need-extra">+ Ask for an emergency driver</button></div>
       ${others(first) ? `<div style="margin-top:8px"><b class="small">Today</b>${others(first)}</div>` : ''}</div>
+    ${data.trips.length ? `<div class="card section"><h2>Deliveries today (${data.trips.filter((t) => t.dropAt).length} done)</h2>${data.trips.map((t) => tripRow(t, { showDriver: true, showUnit: false })).join('')}</div>` : ''}
     <div class="card"><h2>Next days</h2><div class="daylist">${list}</div></div>`;
   document.getElementById('need-extra').onclick = () => askExtra(data);
   $app.querySelectorAll('[data-cancel]').forEach((b) => (b.onclick = async () => {
@@ -260,6 +261,126 @@ function askExtra(data) {
   load();
 }
 
+
+// ---------- deliveries helpers ----------
+function fmtTime(iso) {
+  if (!iso) return '';
+  return new Date(iso).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: state.pub.timezone || 'Asia/Kolkata' });
+}
+function fmtDur(min) {
+  if (min == null) return '';
+  const h = Math.floor(min / 60);
+  return h ? `${h}h ${min % 60}m` : `${min}m`;
+}
+function thumb(url, label) {
+  return url ? `<a href="${esc(url)}" target="_blank" rel="noopener" title="${esc(label)}"><img src="${esc(url)}" alt="${esc(label)}" class="thumb" loading="lazy"></a>` : '';
+}
+
+// Shrink a camera photo before upload (keeps uploads fast and disk use low).
+async function compressImage(file, max = 1280, quality = 0.7) {
+  let src;
+  try {
+    src = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  } catch {
+    src = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('Could not read the photo'));
+      img.src = URL.createObjectURL(file);
+    });
+  }
+  const scale = Math.min(1, max / Math.max(src.width, src.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(src.width * scale);
+  c.height = Math.round(src.height * scale);
+  c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', quality);
+}
+
+// Finger / mouse signature box. Returns { isEmpty(), toDataURL(), clear() }.
+function signaturePad(canvas) {
+  const ratio = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 300;
+  const hgt = canvas.clientHeight || 160;
+  canvas.width = w * ratio;
+  canvas.height = hgt * ratio;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(ratio, ratio);
+  ctx.lineWidth = 2.2;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#111';
+  let drawing = false;
+  let empty = true;
+  const pos = (e) => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  canvas.addEventListener('pointerdown', (e) => { drawing = true; canvas.setPointerCapture(e.pointerId); const [x, y] = pos(e); ctx.beginPath(); ctx.moveTo(x, y); });
+  canvas.addEventListener('pointermove', (e) => { if (!drawing) return; const [x, y] = pos(e); ctx.lineTo(x, y); ctx.stroke(); empty = false; });
+  const stop = () => { drawing = false; };
+  canvas.addEventListener('pointerup', stop);
+  canvas.addEventListener('pointercancel', stop);
+  return {
+    isEmpty: () => empty,
+    clear: () => { ctx.clearRect(0, 0, w, hgt); empty = true; },
+    toDataURL: () => {
+      // white background so the signature is readable anywhere
+      const out = document.createElement('canvas');
+      out.width = canvas.width; out.height = canvas.height;
+      const o = out.getContext('2d');
+      o.fillStyle = '#fff'; o.fillRect(0, 0, out.width, out.height); o.drawImage(canvas, 0, 0);
+      return out.toDataURL('image/jpeg', 0.8);
+    },
+  };
+}
+
+// Shared pickup / drop form. kind = 'pickup' | 'drop'.
+function deliveryForm(kind, { units = [], defaultUnit = '', trip = null, onDone }) {
+  const isPick = kind === 'pickup';
+  openModal(`<h2>${isPick ? '📦 Pickup' : '✅ Drop / delivery'}</h2>
+    ${isPick
+      ? `<label>Unit</label><select name="unitId" required>${units.map((u) => `<option value="${esc(u.id)}" ${u.id === defaultUnit ? 'selected' : ''}>${esc(u.name)}</option>`).join('')}</select>`
+      : `<div class="muted">${esc(trip.unitName)} · picked up at ${esc(fmtTime(trip.pickupAt))}${trip.pickupNote ? ' · ' + esc(trip.pickupNote) : ''}</div>`}
+    <label>${isPick ? 'Photo of pickup material *' : 'Photo of challan *'}</label>
+    <input type="file" name="photo" accept="image/*" capture="environment" required>
+    <img id="preview" class="thumb" style="display:none;width:120px;height:auto;margin-top:6px">
+    <label>${isPick ? 'Pickup from / material (optional)' : 'Delivered to – party / place (optional)'}</label>
+    <input name="note" placeholder="${isPick ? 'e.g. 20 boxes from store' : 'e.g. ABC Traders, Andheri'}">
+    <label>Signature ${isPick ? 'of person handing over' : 'of receiver'} *</label>
+    <canvas id="sig" class="sig"></canvas>
+    <div class="row"><button type="button" class="link" id="sig-clear">Clear signature</button></div>
+    <label>Name of person signing</label>
+    <input name="signer" placeholder="optional">
+    <div class="muted small" style="margin-top:8px">The time is recorded automatically when you save.</div>
+    <div class="actions"><button value="cancel">Cancel</button><button class="primary" value="ok">${isPick ? 'Save pickup' : 'Save drop'}</button></div>`,
+  async (fd) => {
+    const file = fd.get('photo');
+    if (!file || !file.size) throw new Error(isPick ? 'Photo of the material is required' : 'Photo of the challan is required');
+    if (pad.isEmpty()) throw new Error('Signature is required');
+    const photo = await compressImage(file);
+    const body = { photo, signature: pad.toDataURL(), note: fd.get('note'), signer: fd.get('signer') };
+    if (isPick) await api('/driver/trips', { method: 'POST', body: { ...body, unitId: fd.get('unitId') } });
+    else await api(`/driver/trips/${trip.id}/drop`, { method: 'POST', body });
+    toast(isPick ? 'Pickup saved' : 'Drop saved');
+    onDone();
+  });
+  const pad = signaturePad(document.getElementById('sig'));
+  document.getElementById('sig-clear').onclick = () => pad.clear();
+  modalBody.querySelector('[name=photo]').onchange = (e) => {
+    const f = e.target.files[0];
+    const img = document.getElementById('preview');
+    if (f) { img.src = URL.createObjectURL(f); img.style.display = 'block'; }
+  };
+}
+
+function tripRow(t, { showDriver = false, showUnit = true } = {}) {
+  return `<div class="trip">
+    <div class="row"><b>${showDriver ? esc(t.driverName) + ' · ' : ''}${showUnit ? esc(t.unitName) : ''}</b>
+      ${t.dropAt ? `<span class="badge ok">Delivered · ${esc(fmtDur(t.minutes))}</span>` : '<span class="badge warn">In transit</span>'}</div>
+    <div class="small">📦 Pickup ${esc(fmtTime(t.pickupAt))}${t.pickupNote ? ' · ' + esc(t.pickupNote) : ''}${t.pickupSigner ? ' · signed by ' + esc(t.pickupSigner) : ''}</div>
+    ${t.dropAt ? `<div class="small">✅ Drop ${esc(fmtTime(t.dropAt))}${t.dropNote ? ' · ' + esc(t.dropNote) : ''}${t.dropSigner ? ' · signed by ' + esc(t.dropSigner) : ''}</div>` : ''}
+    <div class="thumbs">${thumb(t.pickupPhoto, 'Pickup material')}${thumb(t.pickupSign, 'Pickup signature')}${thumb(t.dropPhoto, 'Challan')}${thumb(t.dropSign, 'Drop signature')}</div>
+  </div>`;
+}
+
 // ---------- driver view ----------
 async function renderDriver() {
   $app.innerHTML = topbar('Driver: ' + state.me.name) + '<div class="wrap"><div class="loading">Loading…</div></div>';
@@ -281,8 +402,22 @@ async function renderDriver() {
   }
   const list = rest.map((d) => `<div class="day"><div class="date">${esc(dayName(d.date))}<small>${esc(fmtDate(d.date, { day: 'numeric', month: 'short' }))}</small></div>
     <div>${!d.working ? '<span class="muted">Off day</span>' : d.onLeave ? '<span class="badge warn">Leave</span>' : d.unit ? `<b>${esc(d.unit.name)}</b>${d.extra ? ' <span class="badge warn">Emergency</span>' : ''}${d.unit.address ? `<div class="muted small">${esc(d.unit.address)}</div>` : ''}` : '<span class="muted">Rest day</span>'}</div></div>`).join('');
+  const open = data.trips.filter((t) => !t.dropAt);
+  const done = data.trips.filter((t) => t.dropAt && t.date === data.today);
+  const totalMin = done.reduce((n, t) => n + t.minutes, 0);
   $app.querySelector('.wrap').innerHTML = `${hero}
+    <div class="card section">
+      <div class="row"><div><h2 style="margin:0">Deliveries today</h2>
+        <div class="muted small">${done.length} delivered${done.length ? ' · ' + esc(fmtDur(totalMin)) + ' total' : ''}${open.length ? ` · <b style="color:var(--warn)">${open.length} in transit</b>` : ''}</div></div>
+        <div class="spacer"></div><button class="primary" id="new-pickup">📦 New pickup</button></div>
+      ${open.length ? `<div class="error" style="background:var(--warn-bg);color:var(--warn)">Complete the drop (challan photo + signature) for every pickup.</div>` : ''}
+      ${open.map((t) => `${tripRow(t)}<button class="primary" data-drop="${esc(t.id)}" style="margin:4px 0 10px">✅ Drop – upload challan</button>`).join('')}
+      ${done.map((t) => tripRow(t)).join('')}
+      ${!data.trips.length ? '<p class="muted small">Tap "New pickup" when you collect material. At delivery, tap "Drop" and upload the challan.</p>' : ''}
+    </div>
     <div class="card"><div class="row"><h2>Next days</h2><div class="spacer"></div><span class="badge ok">${data.monthDuties} duties this month</span></div><div class="daylist">${list}</div></div>`;
+  document.getElementById('new-pickup').onclick = () => deliveryForm('pickup', { units: data.units, defaultUnit: first.unit ? first.unit.id : '', onDone: renderDriver });
+  $app.querySelectorAll('[data-drop]').forEach((b) => (b.onclick = () => deliveryForm('drop', { trip: data.trips.find((t) => t.id === b.dataset.drop), onDone: renderDriver })));
 }
 
 // ---------- admin ----------
@@ -291,6 +426,7 @@ const TABS = [
   ['schedule', 'Schedule'],
   ['units', 'Units'],
   ['drivers', 'Drivers'],
+  ['deliveries', 'Deliveries'],
   ['leaves', 'Leave'],
   ['report', 'Fairness report'],
   ['settings', 'Settings'],
@@ -317,7 +453,7 @@ async function renderAdmin() {
     return;
   }
   const main = document.getElementById('main');
-  const views = { today: adminToday, schedule: adminSchedule, units: adminUnits, drivers: adminDrivers, leaves: adminLeaves, report: adminReport, settings: adminSettings };
+  const views = { deliveries: adminDeliveries, today: adminToday, schedule: adminSchedule, units: adminUnits, drivers: adminDrivers, leaves: adminLeaves, report: adminReport, settings: adminSettings };
   await views[state.tab](main);
 }
 
@@ -638,6 +774,40 @@ async function adminReport(main) {
   document.getElementById('rgo').onclick = () => { state.repFrom = document.getElementById('rf').value; state.repTo = document.getElementById('rt').value; renderAdmin(); };
 }
 
+// --- Deliveries ---
+async function adminDeliveries(main) {
+  const t = A().today;
+  const from = state.delFrom || t;
+  const to = state.delTo || from;
+  const r = await api(`/admin/trips?from=${from}&to=${to}`);
+  const drivers = state.delDriver || '';
+  const list = r.trips.filter((x) => !drivers || x.driverId === drivers);
+  const done = list.filter((x) => x.dropAt);
+  const sumRows = r.summary.map((x) => `<tr><td><b>${esc(x.name)}</b> ${vbadge(x.vehicleType)}</td><td class="num"><b>${x.done}</b></td>
+    <td class="num">${x.open ? `<span class="badge warn">${x.open}</span>` : '0'}</td><td class="num">${esc(fmtDur(x.minutes))}</td><td class="num">${x.done ? esc(fmtDur(Math.round(x.minutes / x.done))) : '–'}</td></tr>`).join('');
+  main.innerHTML = `<div class="row section"><h1>Deliveries</h1><div class="spacer"></div>
+      <input type="date" id="df" value="${esc(from)}" style="width:auto"> to <input type="date" id="dt" value="${esc(to)}" style="width:auto">
+      <button id="dgo">Show</button><a class="btn" href="/api/admin/trips.csv?from=${esc(from)}&to=${esc(to)}">⬇️ Excel (CSV)</a></div>
+    <div class="grid section">
+      <div class="card"><div class="muted small">Delivered</div><div style="font-size:1.8rem;font-weight:800">${r.trips.filter((x) => x.dropAt).length}</div></div>
+      <div class="card"><div class="muted small">In transit / not dropped</div><div style="font-size:1.8rem;font-weight:800;color:var(--warn)">${r.trips.filter((x) => !x.dropAt).length}</div></div>
+      <div class="card"><div class="muted small">Total driving time</div><div style="font-size:1.8rem;font-weight:800">${esc(fmtDur(r.trips.reduce((n, x) => n + (x.minutes || 0), 0)) || '0m')}</div></div>
+    </div>
+    <h2>Per driver</h2>
+    ${r.summary.length ? `<div class="table-wrap section"><table><thead><tr><th>Driver</th><th class="num">Delivered</th><th class="num">Not dropped</th><th class="num">Total time</th><th class="num">Avg / delivery</th></tr></thead><tbody>${sumRows}</tbody></table></div>` : '<div class="card muted section">No deliveries recorded for these dates.</div>'}
+    ${r.trips.length ? `<div class="row"><h2>All deliveries</h2><div class="spacer"></div>
+      <select id="ddrv" style="width:auto"><option value="">All drivers</option>${r.summary.map((x) => `<option value="${esc(x.driverId)}" ${drivers === x.driverId ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></div>
+      <div class="card">${list.map((x) => `${tripRow(x, { showDriver: true })}<div class="row" style="justify-content:flex-end"><span class="muted small">${esc(fmtDate(x.date))}</span><button class="link danger small" data-deltrip="${esc(x.id)}">Delete</button></div>`).join('')}</div>` : ''}
+    <p class="muted small">Photos are kept for ${esc(A().settings.photoDays || 120)} days (change in Settings); times and names are kept forever. ${done.length ? '' : ''}</p>`;
+  document.getElementById('dgo').onclick = () => { state.delFrom = document.getElementById('df').value; state.delTo = document.getElementById('dt').value; renderAdmin(); };
+  const dd = document.getElementById('ddrv');
+  if (dd) dd.onchange = () => { state.delDriver = dd.value; renderAdmin(); };
+  main.querySelectorAll('[data-deltrip]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('Delete this delivery entry and its photos?')) return;
+    try { await api(`/admin/trips/${b.dataset.deltrip}`, { method: 'DELETE' }); toast('Deleted'); renderAdmin(); } catch (ex) { toast(ex.message, true); }
+  }));
+}
+
 // --- Settings ---
 function adminSettings(main) {
   const s = A().settings;
@@ -647,6 +817,7 @@ function adminSettings(main) {
         <div><label>Company / app name</label><input name="orgName" value="${esc(s.orgName)}"></div>
         <div><label>Plan ahead (days)</label><input name="horizonDays" type="number" min="1" max="60" value="${esc(s.horizonDays)}"></div>
         <div><label>Time zone</label><input name="timezone" value="${esc(s.timezone)}"></div>
+        <div><label>Keep delivery photos (days)</label><input name="photoDays" type="number" min="7" max="3650" value="${esc(s.photoDays || 120)}"></div>
       </div>
       <label>Weekly off days (no deliveries)</label>
       <div>${DAYS.map((d, i) => `<label class="check"><input type="checkbox" name="off" value="${i}" ${s.offDays.includes(i) ? 'checked' : ''}> ${d}</label>`).join('')}</div>
@@ -669,7 +840,7 @@ function adminSettings(main) {
     const fd = new FormData(sf);
     try {
       await api('/admin/settings', { method: 'PUT', body: {
-        orgName: fd.get('orgName'), horizonDays: fd.get('horizonDays'), timezone: fd.get('timezone'),
+        orgName: fd.get('orgName'), horizonDays: fd.get('horizonDays'), timezone: fd.get('timezone'), photoDays: fd.get('photoDays'),
         offDays: fd.getAll('off').map(Number), holidays: String(fd.get('holidays')).split(/[\s,]+/).filter(Boolean),
       } });
       state.pub.orgName = fd.get('orgName') || state.pub.orgName;

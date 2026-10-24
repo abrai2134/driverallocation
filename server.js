@@ -1,6 +1,7 @@
 const path = require('path');
 const express = require('express');
 const { Store, newId } = require('./lib/store');
+const { Files } = require('./lib/files');
 const auth = require('./lib/auth');
 const S = require('./lib/scheduler');
 const { todayIn, addDays, range, isValid } = require('./lib/dates');
@@ -8,6 +9,9 @@ const { todayIn, addDays, range, isValid } = require('./lib/dates');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const store = new Store(path.join(DATA_DIR, 'db.json'));
 const db = () => store.db;
+const files = new Files(path.join(DATA_DIR, 'uploads'));
+if (!Array.isArray(store.db.trips)) store.db.trips = [];
+if (!store.db.settings.photoDays) store.db.settings.photoDays = 120;
 
 const VEHICLE_TYPES = ['4W', '3W', '2W'];
 const SESSION_DAYS = 30;
@@ -36,7 +40,7 @@ function changed() {
 // ---------- app ----------
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '15mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Simple brute-force protection for login.
@@ -82,7 +86,7 @@ const norm = (v) => str(v).toLowerCase();
 
 // ---------- public ----------
 app.get('/api/public', (req, res) => {
-  res.json({ orgName: db().settings.orgName, vehicleTypes: VEHICLE_TYPES });
+  res.json({ orgName: db().settings.orgName, vehicleTypes: VEHICLE_TYPES, timezone: db().settings.timezone });
 });
 
 app.post('/api/login', (req, res) => {
@@ -175,7 +179,8 @@ app.get('/api/unit/home', need('unit'), (req, res) => {
       .assignments.filter((a) => a.date === date && a.extra && a.driverId && a.unitId !== u.id)
       .map((a) => ({ driver: (db().drivers.find((d) => d.id === a.driverId) || {}).name, unit: (db().units.find((x) => x.id === a.unitId) || {}).name, fromMe: a.fromUnitId === u.id })),
   }));
-  res.json({ today: t, unit: unitView(u), days });
+  const trips = db().trips.filter((x) => x.unitId === u.id && x.date === t).sort((a, b) => (a.pickupAt < b.pickupAt ? 1 : -1)).map(tripView);
+  res.json({ today: t, unit: unitView(u), days, trips });
 });
 
 function unitDate(req, res) {
@@ -246,10 +251,121 @@ app.get('/api/driver/home', need('driver'), (req, res) => {
   });
   const month = t.slice(0, 7);
   const monthDuties = db().assignments.filter((a) => a.driverId === d.id && a.date.startsWith(month) && a.date <= t).length;
-  res.json({ today: t, driver: driverView(d), days, monthDuties });
+  const trips = db()
+    .trips.filter((x) => x.driverId === d.id && (x.date === t || !x.dropAt))
+    .sort((a, b) => (a.pickupAt < b.pickupAt ? 1 : -1))
+    .map(tripView);
+  const units = db().units.filter((x) => x.active && !x.deleted).map((x) => ({ id: x.id, name: x.name }));
+  res.json({ today: t, driver: driverView(d), days, monthDuties, trips, units });
 });
 
 // ---------- admin ----------
+// ---------- deliveries (pickup / drop) ----------
+const PHOTO_FIELDS = ['pickupPhoto', 'pickupSign', 'dropPhoto', 'dropSign'];
+
+function tripView(t) {
+  const d = db().drivers.find((x) => x.id === t.driverId) || {};
+  const u = db().units.find((x) => x.id === t.unitId) || {};
+  const out = {
+    id: t.id, date: t.date, driverId: t.driverId, driverName: d.name || '(removed)', vehicleType: d.vehicleType || '',
+    unitId: t.unitId, unitName: u.name || '(removed)',
+    pickupAt: t.pickupAt, pickupNote: t.pickupNote || '', pickupSigner: t.pickupSigner || '',
+    dropAt: t.dropAt || null, dropNote: t.dropNote || '', dropSigner: t.dropSigner || '',
+    minutes: t.dropAt ? Math.round((Date.parse(t.dropAt) - Date.parse(t.pickupAt)) / 60000) : null,
+    photosRemoved: !!t.photosRemoved,
+  };
+  for (const f of PHOTO_FIELDS) out[f] = t[f] ? '/api/files/' + t[f] : null;
+  return out;
+}
+
+function canSeeTrip(user, t) {
+  if (!user) return false;
+  if (user.role === 'admin') return true;
+  if (user.role === 'driver') return t.driverId === user.id;
+  if (user.role === 'unit') return t.unitId === user.id;
+  return false;
+}
+
+// Photos are served only to people allowed to see that delivery.
+app.get('/api/files/:name', (req, res) => {
+  const name = req.params.name;
+  const t = db().trips.find((x) => PHOTO_FIELDS.some((f) => x[f] === name));
+  const p = files.pathOf(name);
+  if (!t || !p || !canSeeTrip(req.user, t)) return res.status(404).json({ error: 'Not found' });
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  res.sendFile(p);
+});
+
+function saveImages(body, kind, saved) {
+  const photo = files.saveDataUrl(body.photo, kind);
+  saved.push(photo);
+  if (!body.signature) throw new Error('Signature is required');
+  const sign = files.saveDataUrl(body.signature, 'sign');
+  saved.push(sign);
+  return { photo, sign };
+}
+
+app.post('/api/driver/trips', need('driver'), (req, res) => {
+  const d = req.user.account;
+  const t = today();
+  const unitId = str(req.body.unitId);
+  if (!db().units.some((u) => u.id === unitId && !u.deleted)) return bad(res, 'Choose the unit');
+  const saved = [];
+  try {
+    const { photo, sign } = saveImages(req.body, 'pick', saved);
+    const trip = {
+      id: newId('trip'), date: t, driverId: d.id, unitId,
+      pickupAt: new Date().toISOString(), pickupPhoto: photo, pickupSign: sign,
+      pickupSigner: str(req.body.signer, 80), pickupNote: str(req.body.note, 300),
+      dropAt: null,
+    };
+    db().trips.push(trip);
+    store.save();
+    res.json({ ok: true, trip: tripView(trip) });
+  } catch (e) {
+    saved.forEach((f) => files.remove(f));
+    bad(res, e.message);
+  }
+});
+
+app.post('/api/driver/trips/:id/drop', need('driver'), (req, res) => {
+  const trip = db().trips.find((x) => x.id === req.params.id && x.driverId === req.user.id);
+  if (!trip) return res.status(404).json({ error: 'Delivery not found' });
+  if (trip.dropAt) return bad(res, 'This delivery is already dropped');
+  const saved = [];
+  try {
+    const { photo, sign } = saveImages(req.body, 'drop', saved);
+    Object.assign(trip, {
+      dropAt: new Date().toISOString(), dropPhoto: photo, dropSign: sign,
+      dropSigner: str(req.body.signer, 80), dropNote: str(req.body.note, 300),
+    });
+    store.save();
+    res.json({ ok: true, trip: tripView(trip) });
+  } catch (e) {
+    saved.forEach((f) => files.remove(f));
+    bad(res, e.message);
+  }
+});
+
+// Remove photos older than the retention period (delivery times are kept forever).
+function cleanupPhotos() {
+  const days = Number(db().settings.photoDays) || 120;
+  const cutoff = addDays(today(), -days);
+  let changed = false;
+  for (const t of db().trips) {
+    if (t.date >= cutoff || t.photosRemoved) continue;
+    for (const f of PHOTO_FIELDS) {
+      if (t[f]) files.remove(t[f]);
+      t[f] = null;
+    }
+    t.photosRemoved = true;
+    changed = true;
+  }
+  if (changed) store.save();
+}
+cleanupPhotos();
+setInterval(cleanupPhotos, 6 * 3600 * 1000).unref();
+
 const admin = express.Router();
 admin.use(need('admin'));
 
@@ -475,6 +591,7 @@ admin.put('/settings', (req, res) => {
   }
   if (Array.isArray(b.offDays)) s.offDays = [...new Set(b.offDays.map(Number).filter((n) => n >= 0 && n <= 6))];
   if (Array.isArray(b.holidays)) s.holidays = [...new Set(b.holidays.filter(isValid))].sort();
+  if (b.photoDays !== undefined) s.photoDays = Math.max(7, Math.min(3650, parseInt(b.photoDays, 10) || 120));
   if (b.horizonDays !== undefined) s.horizonDays = Math.max(1, Math.min(60, parseInt(b.horizonDays, 10) || 14));
   changed();
   res.json({ ok: true });
@@ -505,6 +622,49 @@ admin.post('/restore', (req, res) => {
   }
   store.replace(data);
   plan();
+  res.json({ ok: true });
+});
+
+function tripsBetween(from, to) {
+  return db().trips.filter((x) => x.date >= from && x.date <= to).sort((a, b) => (a.pickupAt < b.pickupAt ? 1 : -1));
+}
+
+admin.get('/trips', (req, res) => {
+  const t = today();
+  const from = isValid(req.query.from) ? req.query.from : t;
+  const to = isValid(req.query.to) && req.query.to >= from ? req.query.to : from;
+  const list = tripsBetween(from, to).map(tripView);
+  const byDriver = {};
+  for (const tr of list) {
+    const r = (byDriver[tr.driverId] ||= { driverId: tr.driverId, name: tr.driverName, vehicleType: tr.vehicleType, done: 0, open: 0, minutes: 0 });
+    if (tr.dropAt) { r.done++; r.minutes += tr.minutes; } else r.open++;
+  }
+  const summary = Object.values(byDriver).sort((a, b) => b.done - a.done || a.name.localeCompare(b.name));
+  res.json({ from, to, trips: list, summary });
+});
+
+admin.get('/trips.csv', (req, res) => {
+  const t = today();
+  const from = isValid(req.query.from) ? req.query.from : t;
+  const to = isValid(req.query.to) && req.query.to >= from ? req.query.to : from;
+  const tz = db().settings.timezone;
+  const time = (iso) => (iso ? new Date(iso).toLocaleString('en-IN', { timeZone: tz }) : '');
+  const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const rows = [['Date', 'Driver', 'Vehicle', 'Unit', 'Pickup time', 'Pickup signed by', 'Pickup note', 'Drop time', 'Drop signed by', 'Drop note', 'Minutes']];
+  for (const tr of tripsBetween(from, to).map(tripView)) {
+    rows.push([tr.date, tr.driverName, tr.vehicleType, tr.unitName, time(tr.pickupAt), tr.pickupSigner, tr.pickupNote, time(tr.dropAt), tr.dropSigner, tr.dropNote, tr.minutes ?? 'not dropped']);
+  }
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="deliveries-${from}-to-${to}.csv"`);
+  res.send('\ufeff' + rows.map((r) => r.map(q).join(',')).join('\r\n'));
+});
+
+admin.delete('/trips/:id', (req, res) => {
+  const trip = db().trips.find((x) => x.id === req.params.id);
+  if (!trip) return res.status(404).json({ error: 'Not found' });
+  for (const f of PHOTO_FIELDS) if (trip[f]) files.remove(trip[f]);
+  db().trips = db().trips.filter((x) => x !== trip);
+  store.save();
   res.json({ ok: true });
 });
 
