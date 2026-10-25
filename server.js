@@ -4,7 +4,7 @@ const { Store, newId } = require('./lib/store');
 const { Files } = require('./lib/files');
 const auth = require('./lib/auth');
 const S = require('./lib/scheduler');
-const { todayIn, addDays, range, isValid } = require('./lib/dates');
+const { todayIn, addDays, range, isValid, dateOf, zonedToIso } = require('./lib/dates');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const store = new Store(path.join(DATA_DIR, 'db.json'));
@@ -263,6 +263,21 @@ app.get('/api/driver/home', need('driver'), (req, res) => {
 // ---------- deliveries (pickup / drop) ----------
 const PHOTO_FIELDS = ['pickupPhoto', 'pickupSign', 'dropPhoto', 'dropSign'];
 
+// A drop recorded on a later day than its pickup, with no corrected time, is a wrong entry:
+// its duration is not counted in time totals.
+function tripFlags(t) {
+  if (!t.dropAt) return { wrongEntry: false };
+  const tz = db().settings.timezone;
+  const wrongEntry = !t.dropTimeManual && !t.adminEdited && dateOf(t.dropAt, tz) !== dateOf(t.pickupAt, tz);
+  return { wrongEntry };
+}
+
+// Minutes from pickup to drop that count towards totals (null if not dropped / wrong entry).
+function tripMinutes(t) {
+  if (!t.dropAt || tripFlags(t).wrongEntry) return null;
+  return Math.round((Date.parse(t.dropAt) - Date.parse(t.pickupAt)) / 60000);
+}
+
 function tripView(t) {
   const d = db().drivers.find((x) => x.id === t.driverId) || {};
   const u = db().units.find((x) => x.id === t.unitId) || {};
@@ -271,7 +286,13 @@ function tripView(t) {
     unitId: t.unitId, unitName: u.name || '(removed)',
     pickupAt: t.pickupAt, pickupNote: t.pickupNote || '', pickupSigner: t.pickupSigner || '',
     dropAt: t.dropAt || null, dropNote: t.dropNote || '', dropSigner: t.dropSigner || '',
-    minutes: t.dropAt ? Math.round((Date.parse(t.dropAt) - Date.parse(t.pickupAt)) / 60000) : null,
+    minutes: tripMinutes(t),
+    rawMinutes: t.dropAt ? Math.round((Date.parse(t.dropAt) - Date.parse(t.pickupAt)) / 60000) : null,
+    wrongEntry: tripFlags(t).wrongEntry,
+    dropTimeManual: !!t.dropTimeManual,
+    dropUploadedAt: t.dropUploadedAt || null,
+    adminEdited: !!t.adminEdited,
+    adminNote: t.adminNote || '',
     photosRemoved: !!t.photosRemoved,
   };
   for (const f of PHOTO_FIELDS) out[f] = t[f] ? '/api/files/' + t[f] : null;
@@ -334,9 +355,21 @@ app.post('/api/driver/trips/:id/drop', need('driver'), (req, res) => {
   if (trip.dropAt) return bad(res, 'This delivery is already dropped');
   const saved = [];
   try {
+    // Driver forgot to record the drop at the time: they may enter the actual drop time.
+    const now = new Date();
+    let dropAt = now.toISOString();
+    let manual = false;
+    if (req.body.dropTime) {
+      const iso = zonedToIso(req.body.dropTime, db().settings.timezone);
+      if (!iso) throw new Error('Enter a valid drop date and time');
+      if (Date.parse(iso) <= Date.parse(trip.pickupAt)) throw new Error('Drop time must be after the pickup time');
+      if (Date.parse(iso) > now.getTime() + 5 * 60000) throw new Error('Drop time cannot be in the future');
+      dropAt = iso;
+      manual = true;
+    }
     const { photo, sign } = saveImages(req.body, 'drop', saved);
     Object.assign(trip, {
-      dropAt: new Date().toISOString(), dropPhoto: photo, dropSign: sign,
+      dropAt, dropUploadedAt: now.toISOString(), dropTimeManual: manual, dropPhoto: photo, dropSign: sign,
       dropSigner: str(req.body.signer, 80), dropNote: str(req.body.note, 300),
     });
     store.save();
@@ -355,7 +388,7 @@ function monthly(trips, months = 12) {
   for (let i = 0; i < months; i++) {
     const key = `${y}-${String(m).padStart(2, '0')}`;
     const list = trips.filter((x) => x.dropAt && x.date.startsWith(key));
-    const minutes = list.reduce((n, x) => n + Math.round((Date.parse(x.dropAt) - Date.parse(x.pickupAt)) / 60000), 0);
+    const minutes = list.reduce((n, x) => n + (tripMinutes(x) || 0), 0);
     out.push({ month: key, count: list.length, minutes });
     if (--m === 0) { m = 12; y--; }
   }
@@ -659,7 +692,7 @@ admin.get('/trips', (req, res) => {
   const byDriver = {};
   for (const tr of list) {
     const r = (byDriver[tr.driverId] ||= { driverId: tr.driverId, name: tr.driverName, vehicleType: tr.vehicleType, done: 0, open: 0, minutes: 0 });
-    if (tr.dropAt) { r.done++; r.minutes += tr.minutes; } else r.open++;
+    if (tr.dropAt) { r.done++; r.minutes += tr.minutes || 0; if (tr.wrongEntry) r.wrong = (r.wrong || 0) + 1; } else r.open++;
   }
   const summary = Object.values(byDriver).sort((a, b) => b.done - a.done || a.name.localeCompare(b.name));
   res.json({ from, to, trips: list, summary });
@@ -683,13 +716,33 @@ admin.get('/trips.csv', (req, res) => {
   const tz = db().settings.timezone;
   const time = (iso) => (iso ? new Date(iso).toLocaleString('en-IN', { timeZone: tz }) : '');
   const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const rows = [['Date', 'Driver', 'Vehicle', 'Unit', 'Pickup time', 'Pickup signed by', 'Pickup note', 'Drop time', 'Drop signed by', 'Drop note', 'Minutes']];
+  const rows = [['Date', 'Driver', 'Vehicle', 'Unit', 'Pickup time', 'Pickup signed by', 'Pickup note', 'Drop time', 'Drop signed by', 'Drop note', 'Minutes', 'Remarks']];
   for (const tr of tripsBetween(from, to).map(tripView)) {
-    rows.push([tr.date, tr.driverName, tr.vehicleType, tr.unitName, time(tr.pickupAt), tr.pickupSigner, tr.pickupNote, time(tr.dropAt), tr.dropSigner, tr.dropNote, tr.minutes ?? 'not dropped']);
+    rows.push([tr.date, tr.driverName, tr.vehicleType, tr.unitName, time(tr.pickupAt), tr.pickupSigner, tr.pickupNote, time(tr.dropAt), tr.dropSigner, tr.dropNote, !tr.dropAt ? 'not dropped' : tr.wrongEntry ? 'not counted' : tr.minutes,
+      [tr.wrongEntry && 'Wrong entry - drop uploaded next day', tr.dropTimeManual && `Drop time entered manually (uploaded ${time(tr.dropUploadedAt)})`, tr.adminEdited && 'Time corrected by admin', tr.adminNote].filter(Boolean).join('; ')]);
   }
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="deliveries-${from}-to-${to}.csv"`);
   res.send('\ufeff' + rows.map((r) => r.map(q).join(',')).join('\r\n'));
+});
+
+admin.post('/trips/:id/edit', (req, res) => {
+  const trip = db().trips.find((x) => x.id === req.params.id);
+  if (!trip) return res.status(404).json({ error: 'Not found' });
+  const tz = db().settings.timezone;
+  const pickupAt = req.body.pickup ? zonedToIso(req.body.pickup, tz) : trip.pickupAt;
+  const dropAt = req.body.drop ? zonedToIso(req.body.drop, tz) : trip.dropAt;
+  if (!pickupAt) return bad(res, 'Enter a valid pickup time');
+  if (req.body.drop && !dropAt) return bad(res, 'Enter a valid drop time');
+  if (dropAt && Date.parse(dropAt) <= Date.parse(pickupAt)) return bad(res, 'Drop time must be after pickup time');
+  const changed = pickupAt !== trip.pickupAt || (dropAt || null) !== (trip.dropAt || null);
+  trip.pickupAt = pickupAt;
+  trip.date = dateOf(pickupAt, tz);
+  if (dropAt) trip.dropAt = dropAt;
+  if (changed) trip.adminEdited = true;
+  if (req.body.note !== undefined) trip.adminNote = str(req.body.note, 300);
+  store.save();
+  res.json({ ok: true });
 });
 
 admin.delete('/trips/:id', (req, res) => {

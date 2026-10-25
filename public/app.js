@@ -271,6 +271,21 @@ function fmtTime(iso) {
   if (!iso) return '';
   return new Date(iso).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: state.pub.timezone || 'Asia/Kolkata' });
 }
+// ISO -> 'YYYY-MM-DDTHH:mm' in the company time zone (for <input type="datetime-local">).
+function toLocalInput(iso) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: state.pub.timezone || 'Asia/Kolkata', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+    .formatToParts(iso ? new Date(iso) : new Date()).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
+}
+// Remarks shown on a delivery (wrong entry, manual time, admin correction, admin comment).
+function tripRemarks(t) {
+  const out = [];
+  if (t.wrongEntry) out.push('<span class="badge bad">Wrong entry – drop uploaded next day</span>');
+  if (t.dropTimeManual) out.push(`<span class="badge">Drop time entered manually · uploaded ${esc(fmtDate(toLocalInput(t.dropUploadedAt).slice(0, 10), { day: 'numeric', month: 'short' }))} ${esc(fmtTime(t.dropUploadedAt))}</span>`);
+  if (t.adminEdited) out.push('<span class="badge manual">Time corrected by admin</span>');
+  if (t.adminNote) out.push(`<span class="small">💬 ${esc(t.adminNote)}</span>`);
+  return out.length ? `<div class="row" style="gap:4px;margin-top:4px">${out.join(' ')}</div>` : '';
+}
 function fmtDur(min) {
   if (min == null) return '';
   const h = Math.floor(min / 60);
@@ -353,6 +368,9 @@ function deliveryForm(kind, { units = [], defaultUnit = '', trip = null, onDone 
     <div class="row"><button type="button" class="link" id="sig-clear">Clear signature</button></div>
     <label>Name of person signing</label>
     <input name="signer" placeholder="optional">
+    ${isPick ? '' : `<label class="check" style="margin-top:12px"><input type="checkbox" name="late" id="late" ${trip.date !== toLocalInput().slice(0, 10) ? 'checked' : ''}> I forgot to record the drop at the time – enter the actual drop time</label>
+    <div id="late-box"><label>Actual drop date &amp; time</label><input type="datetime-local" name="dropTime" min="${esc(toLocalInput(trip.pickupAt))}" max="${esc(toLocalInput())}" value="${esc(toLocalInput())}">
+      <div class="muted small">This delivery will be marked "drop time entered manually".</div></div>`}
     <div class="muted small" style="margin-top:8px">The time is recorded automatically when you save.</div>
     <div class="actions"><button value="cancel">Cancel</button><button class="primary" value="ok">${isPick ? 'Save pickup' : 'Save drop'}</button></div>`,
   async (fd) => {
@@ -361,12 +379,23 @@ function deliveryForm(kind, { units = [], defaultUnit = '', trip = null, onDone 
     if (pad.isEmpty()) throw new Error('Signature is required');
     const photo = await compressImage(file);
     const body = { photo, signature: pad.toDataURL(), note: fd.get('note'), signer: fd.get('signer') };
+    if (!isPick && fd.get('late') === 'on') {
+      if (!fd.get('dropTime')) throw new Error('Enter the actual drop date and time');
+      body.dropTime = fd.get('dropTime');
+    }
     if (isPick) await api('/driver/trips', { method: 'POST', body: { ...body, unitId: fd.get('unitId') } });
     else await api(`/driver/trips/${trip.id}/drop`, { method: 'POST', body });
     toast(isPick ? 'Pickup saved' : 'Drop saved');
     onDone();
   });
   const pad = signaturePad(document.getElementById('sig'));
+  const late = document.getElementById('late');
+  if (late) {
+    const box = document.getElementById('late-box');
+    const sync = () => (box.hidden = !late.checked);
+    late.onchange = sync;
+    sync();
+  }
   document.getElementById('sig-clear').onclick = () => pad.clear();
   modalBody.querySelector('[name=photo]').onchange = (e) => {
     const f = e.target.files[0];
@@ -380,6 +409,7 @@ function tripRow(t, { showDriver = false, showUnit = true } = {}) {
     <div class="row"><b>${showDriver ? esc(t.driverName) + ' · ' : ''}${showUnit ? esc(t.unitName) : ''}</b>
       ${t.dropAt ? `<span class="badge ok">Delivered · ${esc(fmtDur(t.minutes))}</span>` : '<span class="badge warn">In transit</span>'}</div>
     <div class="small">📦 Pickup ${esc(fmtTime(t.pickupAt))}${t.pickupNote ? ' · ' + esc(t.pickupNote) : ''}${t.pickupSigner ? ' · signed by ' + esc(t.pickupSigner) : ''}</div>
+    ${tripRemarks(t)}
     ${t.dropAt ? `<div class="small">✅ Drop ${esc(fmtTime(t.dropAt))}${t.dropNote ? ' · ' + esc(t.dropNote) : ''}${t.dropSigner ? ' · signed by ' + esc(t.dropSigner) : ''}</div>` : ''}
     <div class="thumbs">${thumb(t.pickupPhoto, 'Pickup material')}${thumb(t.pickupSign, 'Pickup signature')}${thumb(t.dropPhoto, 'Challan')}${thumb(t.dropSign, 'Drop signature')}</div>
   </div>`;
@@ -448,9 +478,12 @@ function doneList(trips, { showDriver = false, showDate = false } = {}) {
       <div class="grow">
         <div><b>${showDriver ? esc(t.driverName) + ' · ' : ''}${esc(t.unitName)}</b>${t.dropNote ? ` <span class="small muted">→ ${esc(t.dropNote)}</span>` : ''}</div>
         <div class="small muted">${showDate ? esc(fmtDate(t.date)) + ' · ' : ''}📦 ${esc(fmtTime(t.pickupAt))} → ✅ ${esc(fmtTime(t.dropAt))}${t.pickupNote ? ' · ' + esc(t.pickupNote) : ''}</div>
+        ${tripRemarks(t)}
         <div class="thumbs small-thumbs">${thumb(t.pickupPhoto, 'Pickup material')}${thumb(t.pickupSign, 'Pickup signature')}${thumb(t.dropPhoto, 'Challan')}${thumb(t.dropSign, 'Drop signature')}</div>
       </div>
-      <div class="dur">${esc(fmtDur(t.minutes))}<div class="small muted">time taken</div></div>
+      ${t.wrongEntry
+        ? `<div class="dur" style="color:var(--bad)">Wrong entry<div class="small muted">${esc(fmtDur(t.rawMinutes))} · not counted</div></div>`
+        : `<div class="dur">${esc(fmtDur(t.minutes))}<div class="small muted">time taken</div></div>`}
     </div>`).join('')}</div>`;
 }
 
@@ -833,7 +866,7 @@ async function adminDeliveries(main) {
   const list = r.trips.filter((x) => !drivers || x.driverId === drivers);
   const done = list.filter((x) => x.dropAt);
   const sumRows = r.summary.map((x) => `<tr><td><b>${esc(x.name)}</b> ${vbadge(x.vehicleType)}</td><td class="num"><b>${x.done}</b></td>
-    <td class="num">${x.open ? `<span class="badge warn">${x.open}</span>` : '0'}</td><td class="num">${esc(fmtDur(x.minutes))}</td><td class="num">${x.done ? esc(fmtDur(Math.round(x.minutes / x.done))) : '–'}</td></tr>`).join('');
+    <td class="num">${x.open ? `<span class="badge warn">${x.open}</span>` : '0'}${x.wrong ? ` <span class="badge bad" title="wrong entries">${x.wrong} wrong</span>` : ''}</td><td class="num">${esc(fmtDur(x.minutes))}</td><td class="num">${x.done ? esc(fmtDur(Math.round(x.minutes / x.done))) : '–'}</td></tr>`).join('');
   main.innerHTML = `<div class="row section"><h1>Deliveries</h1><div class="spacer"></div>
       <input type="date" id="df" value="${esc(from)}" style="width:auto"> to <input type="date" id="dt" value="${esc(to)}" style="width:auto">
       <button id="dgo">Show</button><a class="btn" href="/api/admin/trips.csv?from=${esc(from)}&to=${esc(to)}">⬇️ Excel (CSV)</a></div>
@@ -846,7 +879,7 @@ async function adminDeliveries(main) {
     ${r.summary.length ? `<div class="table-wrap section"><table><thead><tr><th>Driver</th><th class="num">Delivered</th><th class="num">Not dropped</th><th class="num">Total time</th><th class="num">Avg / delivery</th></tr></thead><tbody>${sumRows}</tbody></table></div>` : '<div class="card muted section">No deliveries recorded for these dates.</div>'}
     ${r.trips.length ? `<div class="row"><h2>All deliveries</h2><div class="spacer"></div>
       <select id="ddrv" style="width:auto"><option value="">All drivers</option>${r.summary.map((x) => `<option value="${esc(x.driverId)}" ${drivers === x.driverId ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></div>
-      <div class="card">${list.map((x) => `${x.dropAt ? doneList([x], { showDriver: true, showDate: true }) : tripRow(x, { showDriver: true })}<div class="row" style="justify-content:flex-end"><button class="link danger small" data-deltrip="${esc(x.id)}">Delete</button></div>`).join('')}</div>` : ''}
+      <div class="card">${list.map((x) => `${x.dropAt ? doneList([x], { showDriver: true, showDate: true }) : tripRow(x, { showDriver: true })}<div class="row" style="justify-content:flex-end"><button class="link small" data-edittrip="${esc(x.id)}">Correct time / comment</button><button class="link danger small" data-deltrip="${esc(x.id)}">Delete</button></div>`).join('')}</div>` : ''}
     <h2 style="margin-top:18px">Month-wise (completed deliveries · time)</h2>
     ${monthGrid(mon.months, mon.drivers, 'Driver')}
     ${monthGrid(mon.months, mon.units, 'Unit')}
@@ -854,6 +887,20 @@ async function adminDeliveries(main) {
   document.getElementById('dgo').onclick = () => { state.delFrom = document.getElementById('df').value; state.delTo = document.getElementById('dt').value; renderAdmin(); };
   const dd = document.getElementById('ddrv');
   if (dd) dd.onchange = () => { state.delDriver = dd.value; renderAdmin(); };
+  main.querySelectorAll('[data-edittrip]').forEach((b) => (b.onclick = () => {
+    const x = r.trips.find((y) => y.id === b.dataset.edittrip);
+    openModal(`<h2>Correct delivery</h2><div class="muted">${esc(x.driverName)} · ${esc(x.unitName)}</div>
+      <label>Pickup date &amp; time</label><input type="datetime-local" name="pickup" value="${esc(toLocalInput(x.pickupAt))}" required>
+      <label>Drop date &amp; time ${x.dropAt ? '' : '(not dropped yet – fill to close it)'}</label><input type="datetime-local" name="drop" value="${x.dropAt ? esc(toLocalInput(x.dropAt)) : ''}">
+      <label>Comment</label><input name="note" value="${esc(x.adminNote)}" placeholder="e.g. Wrong entry – actual drop 3:30 pm">
+      <p class="muted small">Changing a time marks it "Time corrected by admin" and counts its time again.</p>
+      <div class="actions"><button value="cancel">Cancel</button><button class="primary" value="ok">Save</button></div>`,
+    async (fd) => {
+      await api(`/admin/trips/${x.id}/edit`, { method: 'POST', body: { pickup: fd.get('pickup'), drop: fd.get('drop'), note: fd.get('note') } });
+      toast('Saved');
+      renderAdmin();
+    });
+  }));
   main.querySelectorAll('[data-deltrip]').forEach((b) => (b.onclick = async () => {
     if (!confirm('Delete this delivery entry and its photos?')) return;
     try { await api(`/admin/trips/${b.dataset.deltrip}`, { method: 'DELETE' }); toast('Deleted'); renderAdmin(); } catch (ex) { toast(ex.message, true); }
