@@ -12,6 +12,13 @@ const db = () => store.db;
 const files = new Files(path.join(DATA_DIR, 'uploads'));
 if (!Array.isArray(store.db.trips)) store.db.trips = [];
 if (!store.db.settings.photoDays) store.db.settings.photoDays = 120;
+// Delivery incentive: minutes x rate of the slab the delivery time falls in; internal
+// (unit to unit) deliveries get internalPercent of that.
+const DEFAULT_INCENTIVE = {
+  slabs: [{ upTo: 60, rate: 0.25 }, { upTo: 120, rate: 0.35 }, { upTo: 240, rate: 0.4 }, { upTo: 360, rate: 0.45 }],
+  internalPercent: 50,
+};
+if (!store.db.settings.incentive) store.db.settings.incentive = DEFAULT_INCENTIVE;
 
 const VEHICLE_TYPES = ['4W', '3W', '2W'];
 const SESSION_DAYS = 30;
@@ -86,7 +93,7 @@ const norm = (v) => str(v).toLowerCase();
 
 // ---------- public ----------
 app.get('/api/public', (req, res) => {
-  res.json({ orgName: db().settings.orgName, vehicleTypes: VEHICLE_TYPES, timezone: db().settings.timezone });
+  res.json({ orgName: db().settings.orgName, vehicleTypes: VEHICLE_TYPES, timezone: db().settings.timezone, internalPercent: (db().settings.incentive || DEFAULT_INCENTIVE).internalPercent });
 });
 
 app.post('/api/login', (req, res) => {
@@ -179,7 +186,7 @@ app.get('/api/unit/home', need('unit'), (req, res) => {
       .assignments.filter((a) => a.date === date && a.extra && a.driverId && a.unitId !== u.id)
       .map((a) => ({ driver: (db().drivers.find((d) => d.id === a.driverId) || {}).name, unit: (db().units.find((x) => x.id === a.unitId) || {}).name, fromMe: a.fromUnitId === u.id })),
   }));
-  const trips = db().trips.filter((x) => x.unitId === u.id && x.date === t).sort((a, b) => (a.pickupAt < b.pickupAt ? 1 : -1)).map(tripView);
+  const trips = db().trips.filter((x) => (x.unitId === u.id || x.dropUnitId === u.id) && x.date === t).sort((a, b) => (a.pickupAt < b.pickupAt ? 1 : -1)).map(tripView);
   res.json({ today: t, unit: unitView(u), days, trips, months: monthly(db().trips.filter((x) => x.unitId === u.id), 6) });
 });
 
@@ -272,6 +279,26 @@ function tripFlags(t) {
   return { wrongEntry };
 }
 
+function incentiveRate(minutes) {
+  const slabs = (db().settings.incentive || DEFAULT_INCENTIVE).slabs;
+  if (!minutes || minutes < 1 || !slabs.length) return 0;
+  const slab = slabs.find((x) => minutes <= x.upTo) || slabs[slabs.length - 1]; // beyond the last slab: last rate
+  return slab.rate;
+}
+
+function unitName(id) {
+  return (db().units.find((x) => x.id === id) || {}).name || '(removed unit)';
+}
+
+// Internal = picked up at a unit and dropped at a unit.
+function tripIncentive(t, minutes) {
+  const internal = !!(t.unitId && t.dropUnitId);
+  const rate = incentiveRate(minutes);
+  const pct = internal ? (db().settings.incentive || DEFAULT_INCENTIVE).internalPercent : 100;
+  const amount = minutes ? Math.round(minutes * rate * pct) / 100 : 0;
+  return { internal, rate, pct, amount };
+}
+
 // Minutes from pickup to drop that count towards totals (null if not dropped / wrong entry).
 function tripMinutes(t) {
   if (!t.dropAt || tripFlags(t).wrongEntry) return null;
@@ -283,12 +310,16 @@ function tripView(t) {
   const u = db().units.find((x) => x.id === t.unitId) || {};
   const out = {
     id: t.id, date: t.date, driverId: t.driverId, driverName: d.name || '(removed)', vehicleType: d.vehicleType || '',
-    unitId: t.unitId, unitName: u.name || '(removed)',
+    unitId: t.unitId || null, unitName: t.unitId ? u.name || '(removed)' : t.pickupOther || 'Other',
+    pickupOther: t.pickupOther || '',
+    dropUnitId: t.dropUnitId || null, dropOther: t.dropOther || '',
+    dropName: t.dropUnitId ? unitName(t.dropUnitId) : t.dropOther || '',
     pickupAt: t.pickupAt, pickupNote: t.pickupNote || '', pickupSigner: t.pickupSigner || '',
     dropAt: t.dropAt || null, dropNote: t.dropNote || '', dropSigner: t.dropSigner || '',
     minutes: tripMinutes(t),
     rawMinutes: t.dropAt ? Math.round((Date.parse(t.dropAt) - Date.parse(t.pickupAt)) / 60000) : null,
     wrongEntry: tripFlags(t).wrongEntry,
+    ...(() => { const i = tripIncentive(t, tripMinutes(t)); return { internal: i.internal, rate: i.rate, incentivePct: i.pct, incentive: t.dropAt ? i.amount : null }; })(),
     dropTimeManual: !!t.dropTimeManual,
     dropUploadedAt: t.dropUploadedAt || null,
     adminEdited: !!t.adminEdited,
@@ -303,7 +334,7 @@ function canSeeTrip(user, t) {
   if (!user) return false;
   if (user.role === 'admin') return true;
   if (user.role === 'driver') return t.driverId === user.id;
-  if (user.role === 'unit') return t.unitId === user.id;
+  if (user.role === 'unit') return t.unitId === user.id || t.dropUnitId === user.id;
   return false;
 }
 
@@ -326,16 +357,28 @@ function saveImages(body, kind, saved) {
   return { photo, sign };
 }
 
+// A place is a unit, or 'OTHER' with a client / vendor name.
+function readPlace(unitId, other) {
+  unitId = str(unitId);
+  if (unitId === 'OTHER') {
+    const name = str(other, 120);
+    if (!name) return { error: 'enter the client / vendor name' };
+    return { unitId: null, other: name };
+  }
+  if (!db().units.some((u) => u.id === unitId && !u.deleted)) return { error: 'choose a unit' };
+  return { unitId, other: '' };
+}
+
 app.post('/api/driver/trips', need('driver'), (req, res) => {
   const d = req.user.account;
   const t = today();
-  const unitId = str(req.body.unitId);
-  if (!db().units.some((u) => u.id === unitId && !u.deleted)) return bad(res, 'Choose the unit');
+  const pick = readPlace(req.body.unitId, req.body.pickupOther);
+  if (pick.error) return bad(res, 'Pickup from: ' + pick.error);
   const saved = [];
   try {
     const { photo, sign } = saveImages(req.body, 'pick', saved);
     const trip = {
-      id: newId('trip'), date: t, driverId: d.id, unitId,
+      id: newId('trip'), date: t, driverId: d.id, unitId: pick.unitId, pickupOther: pick.other,
       pickupAt: new Date().toISOString(), pickupPhoto: photo, pickupSign: sign,
       pickupSigner: str(req.body.signer, 80), pickupNote: str(req.body.note, 300),
       dropAt: null,
@@ -355,6 +398,8 @@ app.post('/api/driver/trips/:id/drop', need('driver'), (req, res) => {
   if (trip.dropAt) return bad(res, 'This delivery is already dropped');
   const saved = [];
   try {
+    const dest = readPlace(req.body.dropUnitId, req.body.dropOther);
+    if (dest.error) throw new Error('Drop to: ' + dest.error);
     // Driver forgot to record the drop at the time: they may enter the actual drop time.
     const now = new Date();
     let dropAt = now.toISOString();
@@ -370,6 +415,7 @@ app.post('/api/driver/trips/:id/drop', need('driver'), (req, res) => {
     const { photo, sign } = saveImages(req.body, 'drop', saved);
     Object.assign(trip, {
       dropAt, dropUploadedAt: now.toISOString(), dropTimeManual: manual, dropPhoto: photo, dropSign: sign,
+      dropUnitId: dest.unitId, dropOther: dest.other,
       dropSigner: str(req.body.signer, 80), dropNote: str(req.body.note, 300),
     });
     store.save();
@@ -389,7 +435,8 @@ function monthly(trips, months = 12) {
     const key = `${y}-${String(m).padStart(2, '0')}`;
     const list = trips.filter((x) => x.dropAt && x.date.startsWith(key));
     const minutes = list.reduce((n, x) => n + (tripMinutes(x) || 0), 0);
-    out.push({ month: key, count: list.length, minutes });
+    const incentive = Math.round(list.reduce((n, x) => n + tripIncentive(x, tripMinutes(x)).amount, 0) * 100) / 100;
+    out.push({ month: key, count: list.length, minutes, incentive });
     if (--m === 0) { m = 12; y--; }
   }
   return out;
@@ -646,6 +693,15 @@ admin.put('/settings', (req, res) => {
   }
   if (Array.isArray(b.offDays)) s.offDays = [...new Set(b.offDays.map(Number).filter((n) => n >= 0 && n <= 6))];
   if (Array.isArray(b.holidays)) s.holidays = [...new Set(b.holidays.filter(isValid))].sort();
+  if (b.incentive && Array.isArray(b.incentive.slabs)) {
+    const slabs = b.incentive.slabs
+      .map((x) => ({ upTo: parseInt(x.upTo, 10), rate: Number(x.rate) }))
+      .filter((x) => x.upTo > 0 && x.rate >= 0 && x.rate < 1000)
+      .sort((a, c) => a.upTo - c.upTo);
+    if (!slabs.length) return bad(res, 'Add at least one incentive slab');
+    const pct = Number(b.incentive.internalPercent);
+    s.incentive = { slabs, internalPercent: pct >= 0 && pct <= 100 ? pct : 50 };
+  }
   if (b.photoDays !== undefined) s.photoDays = Math.max(7, Math.min(3650, parseInt(b.photoDays, 10) || 120));
   if (b.horizonDays !== undefined) s.horizonDays = Math.max(1, Math.min(60, parseInt(b.horizonDays, 10) || 14));
   changed();
@@ -691,8 +747,8 @@ admin.get('/trips', (req, res) => {
   const list = tripsBetween(from, to).map(tripView);
   const byDriver = {};
   for (const tr of list) {
-    const r = (byDriver[tr.driverId] ||= { driverId: tr.driverId, name: tr.driverName, vehicleType: tr.vehicleType, done: 0, open: 0, minutes: 0 });
-    if (tr.dropAt) { r.done++; r.minutes += tr.minutes || 0; if (tr.wrongEntry) r.wrong = (r.wrong || 0) + 1; } else r.open++;
+    const r = (byDriver[tr.driverId] ||= { driverId: tr.driverId, name: tr.driverName, vehicleType: tr.vehicleType, done: 0, open: 0, minutes: 0, incentive: 0, internal: 0 });
+    if (tr.dropAt) { r.done++; r.minutes += tr.minutes || 0; r.incentive = Math.round((r.incentive + (tr.incentive || 0)) * 100) / 100; if (tr.internal) r.internal++; if (tr.wrongEntry) r.wrong = (r.wrong || 0) + 1; } else r.open++;
   }
   const summary = Object.values(byDriver).sort((a, b) => b.done - a.done || a.name.localeCompare(b.name));
   res.json({ from, to, trips: list, summary });
@@ -716,9 +772,10 @@ admin.get('/trips.csv', (req, res) => {
   const tz = db().settings.timezone;
   const time = (iso) => (iso ? new Date(iso).toLocaleString('en-IN', { timeZone: tz }) : '');
   const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const rows = [['Date', 'Driver', 'Vehicle', 'Unit', 'Pickup time', 'Pickup signed by', 'Pickup note', 'Drop time', 'Drop signed by', 'Drop note', 'Minutes', 'Remarks']];
+  const rows = [['Date', 'Driver', 'Vehicle', 'Pickup from', 'Drop to', 'Type', 'Pickup time', 'Pickup signed by', 'Pickup note', 'Drop time', 'Drop signed by', 'Drop note', 'Minutes', 'Rate per min', 'Incentive (Rs)', 'Remarks']];
   for (const tr of tripsBetween(from, to).map(tripView)) {
-    rows.push([tr.date, tr.driverName, tr.vehicleType, tr.unitName, time(tr.pickupAt), tr.pickupSigner, tr.pickupNote, time(tr.dropAt), tr.dropSigner, tr.dropNote, !tr.dropAt ? 'not dropped' : tr.wrongEntry ? 'not counted' : tr.minutes,
+    rows.push([tr.date, tr.driverName, tr.vehicleType, tr.unitName, tr.dropName, tr.dropAt ? (tr.internal ? 'Internal' : 'External') : '', time(tr.pickupAt), tr.pickupSigner, tr.pickupNote, time(tr.dropAt), tr.dropSigner, tr.dropNote, !tr.dropAt ? 'not dropped' : tr.wrongEntry ? 'not counted' : tr.minutes,
+      tr.dropAt && !tr.wrongEntry ? `${tr.rate}${tr.internal ? ` x ${tr.incentivePct}%` : ''}` : '', tr.dropAt ? tr.incentive : '',
       [tr.wrongEntry && 'Wrong entry - drop uploaded next day', tr.dropTimeManual && `Drop time entered manually (uploaded ${time(tr.dropUploadedAt)})`, tr.adminEdited && 'Time corrected by admin', tr.adminNote].filter(Boolean).join('; ')]);
   }
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -741,6 +798,16 @@ admin.post('/trips/:id/edit', (req, res) => {
   if (dropAt) trip.dropAt = dropAt;
   if (changed) trip.adminEdited = true;
   if (req.body.note !== undefined) trip.adminNote = str(req.body.note, 300);
+  if (req.body.pickupUnitId) {
+    const p = readPlace(req.body.pickupUnitId, req.body.pickupOther);
+    if (p.error) return bad(res, 'Pickup from: ' + p.error);
+    trip.unitId = p.unitId; trip.pickupOther = p.other;
+  }
+  if (req.body.dropUnitId && trip.dropAt) {
+    const p = readPlace(req.body.dropUnitId, req.body.dropOther);
+    if (p.error) return bad(res, 'Drop to: ' + p.error);
+    trip.dropUnitId = p.unitId; trip.dropOther = p.other;
+  }
   store.save();
   res.json({ ok: true });
 });

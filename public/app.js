@@ -80,6 +80,8 @@ const modal = document.getElementById('modal');
 const modalBody = document.getElementById('modal-body');
 function openModal(html, onSubmit) {
   modalBody.innerHTML = html;
+  // Cancel must close the form even when required fields are still empty.
+  modalBody.querySelectorAll('button[value=cancel]').forEach((b) => (b.formNoValidate = true));
   modalBody.onsubmit = async (e) => {
     const btn = e.submitter;
     if (btn && btn.value === 'cancel') return; // let dialog close
@@ -101,7 +103,7 @@ function openModal(html, onSubmit) {
 
 // ---------- boot ----------
 async function boot() {
-  try { state.pub = await api('/public'); } catch { /* keep defaults */ }
+  try { state.pub = await api('/public'); state.incentivePct = state.pub.internalPercent; } catch { /* keep defaults */ }
   document.title = state.pub.orgName;
   try { state.me = await api('/me'); } catch { state.me = null; }
   render();
@@ -286,6 +288,26 @@ function tripRemarks(t) {
   if (t.adminNote) out.push(`<span class="small">💬 ${esc(t.adminNote)}</span>`);
   return out.length ? `<div class="row" style="gap:4px;margin-top:4px">${out.join(' ')}</div>` : '';
 }
+function money(v) {
+  return '₹' + (Number(v) || 0).toFixed(2);
+}
+// "Unit / Other" picker used for pickup and drop.
+function placePicker(name, units, selected, otherValue, placeholder) {
+  return `<select name="${name}" class="place-select" required>
+      ${selected ? '' : '<option value="">— Choose —</option>'}
+      ${units.map((u) => `<option value="${esc(u.id)}" ${u.id === selected ? 'selected' : ''}>Unit ${esc(u.name)}</option>`).join('')}
+      <option value="OTHER" ${selected === 'OTHER' ? 'selected' : ''}>Other – client / vendor</option>
+    </select>
+    <input name="${name}Other" class="place-other" placeholder="${esc(placeholder)}" value="${esc(otherValue || '')}" style="margin-top:6px">`;
+}
+function bindPlacePickers(root) {
+  root.querySelectorAll('.place-select').forEach((sel) => {
+    const other = sel.nextElementSibling;
+    const sync = () => { other.hidden = sel.value !== 'OTHER'; other.required = sel.value === 'OTHER'; };
+    sel.addEventListener('change', sync);
+    sync();
+  });
+}
 function fmtDur(min) {
   if (min == null) return '';
   const h = Math.floor(min / 60);
@@ -356,13 +378,15 @@ function deliveryForm(kind, { units = [], defaultUnit = '', trip = null, onDone 
   const isPick = kind === 'pickup';
   openModal(`<h2>${isPick ? '📦 Pickup' : '✅ Drop / delivery'}</h2>
     ${isPick
-      ? `<label>Unit</label><select name="unitId" required>${units.map((u) => `<option value="${esc(u.id)}" ${u.id === defaultUnit ? 'selected' : ''}>${esc(u.name)}</option>`).join('')}</select>`
-      : `<div class="muted">${esc(trip.unitName)} · picked up at ${esc(fmtTime(trip.pickupAt))}${trip.pickupNote ? ' · ' + esc(trip.pickupNote) : ''}</div>`}
+      ? `<label>Pickup from *</label>${placePicker('unitId', units, defaultUnit, '', 'Client / vendor name')}`
+      : `<div class="muted">From ${esc(trip.unitName)} · picked up at ${esc(fmtTime(trip.pickupAt))}${trip.pickupNote ? ' · ' + esc(trip.pickupNote) : ''}</div>
+         <label>Drop to *</label>${placePicker('dropUnitId', units, '', '', 'Client / vendor name')}
+         <div class="muted small">Unit to unit = internal delivery (incentive ${esc(state.incentivePct || 50)}%).</div>`}
     <label>${isPick ? 'Photo of pickup material *' : 'Photo of challan *'}</label>
     <input type="file" name="photo" accept="image/*" capture="environment" required>
     <img id="preview" class="thumb" style="display:none;width:120px;height:auto;margin-top:6px">
-    <label>${isPick ? 'Pickup from / material (optional)' : 'Delivered to – party / place (optional)'}</label>
-    <input name="note" placeholder="${isPick ? 'e.g. 20 boxes from store' : 'e.g. ABC Traders, Andheri'}">
+    <label>${isPick ? 'Material / remarks (optional)' : 'Remarks (optional)'}</label>
+    <input name="note" placeholder="${isPick ? 'e.g. 20 boxes' : 'e.g. delivered at gate'}">
     <label>Signature ${isPick ? 'of person handing over' : 'of receiver'} *</label>
     <canvas id="sig" class="sig"></canvas>
     <div class="row"><button type="button" class="link" id="sig-clear">Clear signature</button></div>
@@ -383,11 +407,12 @@ function deliveryForm(kind, { units = [], defaultUnit = '', trip = null, onDone 
       if (!fd.get('dropTime')) throw new Error('Enter the actual drop date and time');
       body.dropTime = fd.get('dropTime');
     }
-    if (isPick) await api('/driver/trips', { method: 'POST', body: { ...body, unitId: fd.get('unitId') } });
-    else await api(`/driver/trips/${trip.id}/drop`, { method: 'POST', body });
+    if (isPick) await api('/driver/trips', { method: 'POST', body: { ...body, unitId: fd.get('unitId'), pickupOther: fd.get('unitIdOther') } });
+    else await api(`/driver/trips/${trip.id}/drop`, { method: 'POST', body: { ...body, dropUnitId: fd.get('dropUnitId'), dropOther: fd.get('dropUnitIdOther') } });
     toast(isPick ? 'Pickup saved' : 'Drop saved');
     onDone();
   });
+  bindPlacePickers(modalBody);
   const pad = signaturePad(document.getElementById('sig'));
   const late = document.getElementById('late');
   if (late) {
@@ -406,7 +431,7 @@ function deliveryForm(kind, { units = [], defaultUnit = '', trip = null, onDone 
 
 function tripRow(t, { showDriver = false, showUnit = true } = {}) {
   return `<div class="trip">
-    <div class="row"><b>${showDriver ? esc(t.driverName) + ' · ' : ''}${showUnit ? esc(t.unitName) : ''}</b>
+    <div class="row"><b>${showDriver ? esc(t.driverName) + ' · ' : ''}${showUnit ? 'From ' + esc(t.unitName) : ''}${t.dropName ? ' → ' + esc(t.dropName) : ''}</b>
       ${t.dropAt ? `<span class="badge ok">Delivered · ${esc(fmtDur(t.minutes))}</span>` : '<span class="badge warn">In transit</span>'}</div>
     <div class="small">📦 Pickup ${esc(fmtTime(t.pickupAt))}${t.pickupNote ? ' · ' + esc(t.pickupNote) : ''}${t.pickupSigner ? ' · signed by ' + esc(t.pickupSigner) : ''}</div>
     ${tripRemarks(t)}
@@ -445,7 +470,8 @@ async function renderDriver() {
   $app.querySelector('.wrap').innerHTML = `${hero}
     <div class="card section">
       <div class="row"><div><h2 style="margin:0">Deliveries</h2>
-        <div class="muted small">Today: ${done.length} delivered${done.length ? ' · ' + esc(fmtDur(totalMin)) : ''} · This month: ${thisMonth.count} delivered${thisMonth.count ? ' · ' + esc(fmtDur(thisMonth.minutes)) : ''}</div></div>
+        <div class="muted small">Today: ${done.length} delivered${done.length ? ' · ' + esc(fmtDur(totalMin)) : ''} · <b class="bonus-inline">${esc(money(done.reduce((n, t) => n + (t.incentive || 0), 0)))}</b></div>
+        <div class="muted small">This month: ${thisMonth.count} delivered${thisMonth.count ? ' · ' + esc(fmtDur(thisMonth.minutes)) : ''} · <b class="bonus-inline">${esc(money(thisMonth.incentive))}</b> incentive</div></div>
         <div class="spacer"></div><button class="primary" id="new-pickup">📦 New pickup</button></div>
       <div class="subtabs">${tabBtn('transit', `In transit (${open.length})`)}${tabBtn('done', `Completed today (${done.length})`)}${tabBtn('month', 'Monthly')}</div>
       <div id="dtab-body"></div>
@@ -465,7 +491,7 @@ async function renderDriver() {
   }
   $app.querySelectorAll('[data-dtab]').forEach((b) => (b.onclick = () => { state.dTab = b.dataset.dtab; renderDriver(); }));
   document.getElementById('new-pickup').onclick = () => deliveryForm('pickup', { units: data.units, defaultUnit: first.unit ? first.unit.id : '', onDone: () => { state.dTab = 'transit'; renderDriver(); } });
-  $app.querySelectorAll('[data-drop]').forEach((b) => (b.onclick = () => deliveryForm('drop', { trip: data.trips.find((t) => t.id === b.dataset.drop), onDone: () => { state.dTab = 'done'; renderDriver(); } })));
+  $app.querySelectorAll('[data-drop]').forEach((b) => (b.onclick = () => deliveryForm('drop', { units: data.units, trip: data.trips.find((t) => t.id === b.dataset.drop), onDone: () => { state.dTab = 'done'; renderDriver(); } })));
 }
 
 function fmtMonth(m) {
@@ -476,26 +502,26 @@ function fmtMonth(m) {
 function doneList(trips, { showDriver = false, showDate = false } = {}) {
   return `<div class="done-list">${trips.map((t) => `<div class="done-row">
       <div class="grow">
-        <div><b>${showDriver ? esc(t.driverName) + ' · ' : ''}${esc(t.unitName)}</b>${t.dropNote ? ` <span class="small muted">→ ${esc(t.dropNote)}</span>` : ''}</div>
+        <div><b>${showDriver ? esc(t.driverName) + ' · ' : ''}${esc(t.unitName)} → ${esc(t.dropName || '?')}</b> ${t.dropName ? (t.internal ? '<span class="badge">Internal</span>' : '<span class="badge ok">External</span>') : ''}${t.dropNote ? ` <span class="small muted">${esc(t.dropNote)}</span>` : ''}</div>
         <div class="small muted">${showDate ? esc(fmtDate(t.date)) + ' · ' : ''}📦 ${esc(fmtTime(t.pickupAt))} → ✅ ${esc(fmtTime(t.dropAt))}${t.pickupNote ? ' · ' + esc(t.pickupNote) : ''}</div>
         ${tripRemarks(t)}
         <div class="thumbs small-thumbs">${thumb(t.pickupPhoto, 'Pickup material')}${thumb(t.pickupSign, 'Pickup signature')}${thumb(t.dropPhoto, 'Challan')}${thumb(t.dropSign, 'Drop signature')}</div>
       </div>
       ${t.wrongEntry
         ? `<div class="dur" style="color:var(--bad)">Wrong entry<div class="small muted">${esc(fmtDur(t.rawMinutes))} · not counted</div></div>`
-        : `<div class="dur">${esc(fmtDur(t.minutes))}<div class="small muted">time taken</div></div>`}
+        : `<div class="dur">${esc(fmtDur(t.minutes))}<div class="small muted">time taken</div><div class="bonus">${esc(money(t.incentive))}</div><div class="small muted">${t.minutes ? `${t.minutes} min × ${t.rate}${t.internal ? ` × ${t.incentivePct}%` : ''}` : ''}</div></div>`}
     </div>`).join('')}</div>`;
 }
 
-function monthTable(months, onPick, picked) {
-  return `<div class="table-wrap section"><table><thead><tr><th>Month</th><th class="num">Deliveries</th><th class="num">Total time</th><th class="num">Avg / delivery</th></tr></thead><tbody>
-    ${months.map((m) => `<tr ${onPick ? `data-month="${m.month}" style="cursor:pointer"` : ''} class="${picked === m.month ? 'picked' : ''}"><td><b>${esc(fmtMonth(m.month))}</b></td><td class="num"><b>${m.count}</b></td><td class="num">${m.count ? esc(fmtDur(m.minutes)) : '–'}</td><td class="num">${m.count ? esc(fmtDur(Math.round(m.minutes / m.count))) : '–'}</td></tr>`).join('')}
+function monthTable(months, onPick, picked, showIncentive) {
+  return `<div class="table-wrap section"><table><thead><tr><th>Month</th><th class="num">Deliveries</th><th class="num">Total time</th><th class="num">Avg / delivery</th>${showIncentive ? '<th class="num">Incentive</th>' : ''}</tr></thead><tbody>
+    ${months.map((m) => `<tr ${onPick ? `data-month="${m.month}" style="cursor:pointer"` : ''} class="${picked === m.month ? 'picked' : ''}"><td><b>${esc(fmtMonth(m.month))}</b></td><td class="num"><b>${m.count}</b></td><td class="num">${m.count ? esc(fmtDur(m.minutes)) : '–'}</td><td class="num">${m.count ? esc(fmtDur(Math.round(m.minutes / m.count))) : '–'}</td>${showIncentive ? `<td class="num"><b>${m.count ? esc(money(m.incentive)) : '–'}</b></td>` : ''}</tr>`).join('')}
   </tbody></table></div>`;
 }
 
 async function driverMonthly(body, month) {
   const r = await api('/driver/trips' + (month ? '?month=' + month : ''));
-  body.innerHTML = `${monthTable(r.months.filter((m, i) => i === 0 || m.count || m.month === r.month), true, r.month)}
+  body.innerHTML = `${monthTable(r.months.filter((m, i) => i === 0 || m.count || m.month === r.month), true, r.month, true)}
     <h3>${esc(fmtMonth(r.month))} – ${r.trips.length} completed</h3>
     ${r.trips.length ? doneList(r.trips, { showDate: true }) : '<p class="muted">No completed deliveries this month.</p>'}
     <p class="muted small">Tap a month to see its deliveries.</p>`;
@@ -866,17 +892,18 @@ async function adminDeliveries(main) {
   const list = r.trips.filter((x) => !drivers || x.driverId === drivers);
   const done = list.filter((x) => x.dropAt);
   const sumRows = r.summary.map((x) => `<tr><td><b>${esc(x.name)}</b> ${vbadge(x.vehicleType)}</td><td class="num"><b>${x.done}</b></td>
-    <td class="num">${x.open ? `<span class="badge warn">${x.open}</span>` : '0'}${x.wrong ? ` <span class="badge bad" title="wrong entries">${x.wrong} wrong</span>` : ''}</td><td class="num">${esc(fmtDur(x.minutes))}</td><td class="num">${x.done ? esc(fmtDur(Math.round(x.minutes / x.done))) : '–'}</td></tr>`).join('');
+    <td class="num">${x.open ? `<span class="badge warn">${x.open}</span>` : '0'}${x.wrong ? ` <span class="badge bad" title="wrong entries">${x.wrong} wrong</span>` : ''}</td><td class="num">${esc(fmtDur(x.minutes))}</td><td class="num">${x.done ? esc(fmtDur(Math.round(x.minutes / x.done))) : '–'}</td><td class="num">${x.internal}</td><td class="num"><b>${esc(money(x.incentive))}</b></td></tr>`).join('');
   main.innerHTML = `<div class="row section"><h1>Deliveries</h1><div class="spacer"></div>
       <input type="date" id="df" value="${esc(from)}" style="width:auto"> to <input type="date" id="dt" value="${esc(to)}" style="width:auto">
       <button id="dgo">Show</button><a class="btn" href="/api/admin/trips.csv?from=${esc(from)}&to=${esc(to)}">⬇️ Excel (CSV)</a></div>
     <div class="grid section">
       <div class="card"><div class="muted small">Delivered</div><div style="font-size:1.8rem;font-weight:800">${r.trips.filter((x) => x.dropAt).length}</div></div>
       <div class="card"><div class="muted small">In transit / not dropped</div><div style="font-size:1.8rem;font-weight:800;color:var(--warn)">${r.trips.filter((x) => !x.dropAt).length}</div></div>
+      <div class="card"><div class="muted small">Total incentive</div><div style="font-size:1.8rem;font-weight:800;color:var(--ok)">${esc(money(r.summary.reduce((n, x) => n + x.incentive, 0)))}</div></div>
       <div class="card"><div class="muted small">Total driving time</div><div style="font-size:1.8rem;font-weight:800">${esc(fmtDur(r.trips.reduce((n, x) => n + (x.minutes || 0), 0)) || '0m')}</div></div>
     </div>
     <h2>Per driver</h2>
-    ${r.summary.length ? `<div class="table-wrap section"><table><thead><tr><th>Driver</th><th class="num">Delivered</th><th class="num">Not dropped</th><th class="num">Total time</th><th class="num">Avg / delivery</th></tr></thead><tbody>${sumRows}</tbody></table></div>` : '<div class="card muted section">No deliveries recorded for these dates.</div>'}
+    ${r.summary.length ? `<div class="table-wrap section"><table><thead><tr><th>Driver</th><th class="num">Delivered</th><th class="num">Not dropped</th><th class="num">Total time</th><th class="num">Avg / delivery</th><th class="num">Internal</th><th class="num">Incentive</th></tr></thead><tbody>${sumRows}</tbody></table></div>` : '<div class="card muted section">No deliveries recorded for these dates.</div>'}
     ${r.trips.length ? `<div class="row"><h2>All deliveries</h2><div class="spacer"></div>
       <select id="ddrv" style="width:auto"><option value="">All drivers</option>${r.summary.map((x) => `<option value="${esc(x.driverId)}" ${drivers === x.driverId ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></div>
       <div class="card">${list.map((x) => `${x.dropAt ? doneList([x], { showDriver: true, showDate: true }) : tripRow(x, { showDriver: true })}<div class="row" style="justify-content:flex-end"><button class="link small" data-edittrip="${esc(x.id)}">Correct time / comment</button><button class="link danger small" data-deltrip="${esc(x.id)}">Delete</button></div>`).join('')}</div>` : ''}
@@ -892,14 +919,18 @@ async function adminDeliveries(main) {
     openModal(`<h2>Correct delivery</h2><div class="muted">${esc(x.driverName)} · ${esc(x.unitName)}</div>
       <label>Pickup date &amp; time</label><input type="datetime-local" name="pickup" value="${esc(toLocalInput(x.pickupAt))}" required>
       <label>Drop date &amp; time ${x.dropAt ? '' : '(not dropped yet – fill to close it)'}</label><input type="datetime-local" name="drop" value="${x.dropAt ? esc(toLocalInput(x.dropAt)) : ''}">
+      <div class="form-grid"><div><label>Pickup from</label>${placePicker('pickupUnitId', A().units, x.unitId || 'OTHER', x.pickupOther, 'Client / vendor name')}</div>
+      ${x.dropAt ? `<div><label>Drop to</label>${placePicker('dropUnitId', A().units, x.dropUnitId || (x.dropOther ? 'OTHER' : ''), x.dropOther, 'Client / vendor name')}</div>` : ''}</div>
       <label>Comment</label><input name="note" value="${esc(x.adminNote)}" placeholder="e.g. Wrong entry – actual drop 3:30 pm">
       <p class="muted small">Changing a time marks it "Time corrected by admin" and counts its time again.</p>
       <div class="actions"><button value="cancel">Cancel</button><button class="primary" value="ok">Save</button></div>`,
     async (fd) => {
-      await api(`/admin/trips/${x.id}/edit`, { method: 'POST', body: { pickup: fd.get('pickup'), drop: fd.get('drop'), note: fd.get('note') } });
+      await api(`/admin/trips/${x.id}/edit`, { method: 'POST', body: { pickup: fd.get('pickup'), drop: fd.get('drop'), note: fd.get('note'),
+        pickupUnitId: fd.get('pickupUnitId'), pickupOther: fd.get('pickupUnitIdOther'), dropUnitId: fd.get('dropUnitId'), dropOther: fd.get('dropUnitIdOther') } });
       toast('Saved');
       renderAdmin();
     });
+    bindPlacePickers(modalBody);
   }));
   main.querySelectorAll('[data-deltrip]').forEach((b) => (b.onclick = async () => {
     if (!confirm('Delete this delivery entry and its photos?')) return;
@@ -908,7 +939,7 @@ async function adminDeliveries(main) {
 }
 
 function monthGrid(months, rows, label) {
-  const cell = (m) => (m.count ? `<b>${m.count}</b><div class="small muted">${esc(fmtDur(m.minutes))}</div>` : '<span class="muted">–</span>');
+  const cell = (m) => (m.count ? `<b>${m.count}</b><div class="small muted">${esc(fmtDur(m.minutes))}</div>${label === 'Driver' ? `<div class="small" style="color:var(--ok);font-weight:700">${esc(money(m.incentive))}</div>` : ''}` : '<span class="muted">–</span>');
   return `<div class="table-wrap section"><table><thead><tr><th>${label}</th>${months.map((m) => `<th class="num">${esc(new Date(m + '-01T00:00:00Z').toLocaleDateString('en-IN', { month: 'short', year: '2-digit', timeZone: 'UTC' }))}</th>`).join('')}</tr></thead>
     <tbody>${rows.map((r) => `<tr><td><b>${esc(r.name)}</b>${r.vehicleType ? ' ' + vbadge(r.vehicleType) : ''}</td>${r.months.map((m) => `<td class="num">${cell(m)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
@@ -924,6 +955,14 @@ function adminSettings(main) {
         <div><label>Time zone</label><input name="timezone" value="${esc(s.timezone)}"></div>
         <div><label>Keep delivery photos (days)</label><input name="photoDays" type="number" min="7" max="3650" value="${esc(s.photoDays || 120)}"></div>
       </div>
+      <label>Delivery incentive (₹ per minute, by time taken)</label>
+      <div class="muted small">A delivery taking up to "minutes" gets that rate for every minute. Longer than the last row: last rate.</div>
+      <div id="slabs">${(s.incentive ? s.incentive.slabs : []).map((x, i, all) => `<div class="row slab" style="margin:4px 0">
+        <span class="small" style="width:110px">${i === 0 ? '1' : all[i - 1].upTo + 1} – </span>
+        <input class="slab-up" type="number" min="1" value="${esc(x.upTo)}" style="width:90px"> <span class="small">min →</span>
+        <input class="slab-rate" type="number" step="0.01" min="0" value="${esc(x.rate)}" style="width:90px"> <span class="small">₹/min</span></div>`).join('')}</div>
+      <div class="row" style="margin-top:6px"><span class="small">Internal (unit to unit) delivery gets</span>
+        <input name="internalPercent" type="number" min="0" max="100" value="${esc(s.incentive ? s.incentive.internalPercent : 50)}" style="width:80px"> <span class="small">% of this</span></div>
       <label>Weekly off days (no deliveries)</label>
       <div>${DAYS.map((d, i) => `<label class="check"><input type="checkbox" name="off" value="${i}" ${s.offDays.includes(i) ? 'checked' : ''}> ${d}</label>`).join('')}</div>
       <label>Holidays (one date per line, YYYY-MM-DD)</label>
@@ -946,6 +985,7 @@ function adminSettings(main) {
     try {
       await api('/admin/settings', { method: 'PUT', body: {
         orgName: fd.get('orgName'), horizonDays: fd.get('horizonDays'), timezone: fd.get('timezone'), photoDays: fd.get('photoDays'),
+        incentive: { internalPercent: fd.get('internalPercent'), slabs: [...document.querySelectorAll('#slabs .slab')].map((r) => ({ upTo: r.querySelector('.slab-up').value, rate: r.querySelector('.slab-rate').value })) },
         offDays: fd.getAll('off').map(Number), holidays: String(fd.get('holidays')).split(/[\s,]+/).filter(Boolean),
       } });
       state.pub.orgName = fd.get('orgName') || state.pub.orgName;

@@ -193,3 +193,5 @@ dialog .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top
 .done-row .dur { text-align: right; font-weight: 800; font-size: 1.1rem; color: var(--ok); white-space: nowrap; }
 .small-thumbs .thumb { width: 44px; height: 44px; }
 tr.picked td { background: #eaf2fb; }
+.done-row .bonus { margin-top: 4px; color: var(--ok); font-weight: 800; font-size: 1rem; }
+.bonus-inline { color: var(--ok); }
