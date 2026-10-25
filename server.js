@@ -180,7 +180,7 @@ app.get('/api/unit/home', need('unit'), (req, res) => {
       .map((a) => ({ driver: (db().drivers.find((d) => d.id === a.driverId) || {}).name, unit: (db().units.find((x) => x.id === a.unitId) || {}).name, fromMe: a.fromUnitId === u.id })),
   }));
   const trips = db().trips.filter((x) => x.unitId === u.id && x.date === t).sort((a, b) => (a.pickupAt < b.pickupAt ? 1 : -1)).map(tripView);
-  res.json({ today: t, unit: unitView(u), days, trips });
+  res.json({ today: t, unit: unitView(u), days, trips, months: monthly(db().trips.filter((x) => x.unitId === u.id), 6) });
 });
 
 function unitDate(req, res) {
@@ -256,7 +256,7 @@ app.get('/api/driver/home', need('driver'), (req, res) => {
     .sort((a, b) => (a.pickupAt < b.pickupAt ? 1 : -1))
     .map(tripView);
   const units = db().units.filter((x) => x.active && !x.deleted).map((x) => ({ id: x.id, name: x.name }));
-  res.json({ today: t, driver: driverView(d), days, monthDuties, trips, units });
+  res.json({ today: t, driver: driverView(d), days, monthDuties, trips, units, months: monthly(db().trips.filter((x) => x.driverId === d.id), 1) });
 });
 
 // ---------- admin ----------
@@ -345,6 +345,28 @@ app.post('/api/driver/trips/:id/drop', need('driver'), (req, res) => {
     saved.forEach((f) => files.remove(f));
     bad(res, e.message);
   }
+});
+
+// Completed deliveries grouped by month: [{ month: 'YYYY-MM', count, minutes }], newest first.
+function monthly(trips, months = 12) {
+  const t = today();
+  const out = [];
+  let [y, m] = t.slice(0, 7).split('-').map(Number);
+  for (let i = 0; i < months; i++) {
+    const key = `${y}-${String(m).padStart(2, '0')}`;
+    const list = trips.filter((x) => x.dropAt && x.date.startsWith(key));
+    const minutes = list.reduce((n, x) => n + Math.round((Date.parse(x.dropAt) - Date.parse(x.pickupAt)) / 60000), 0);
+    out.push({ month: key, count: list.length, minutes });
+    if (--m === 0) { m = 12; y--; }
+  }
+  return out;
+}
+
+app.get('/api/driver/trips', need('driver'), (req, res) => {
+  const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : today().slice(0, 7);
+  const mine = db().trips.filter((x) => x.driverId === req.user.id);
+  const done = mine.filter((x) => x.dropAt && x.date.startsWith(month)).sort((a, b) => (a.dropAt < b.dropAt ? 1 : -1)).map(tripView);
+  res.json({ month, trips: done, months: monthly(mine) });
 });
 
 // Remove photos older than the retention period (delivery times are kept forever).
@@ -641,6 +663,17 @@ admin.get('/trips', (req, res) => {
   }
   const summary = Object.values(byDriver).sort((a, b) => b.done - a.done || a.name.localeCompare(b.name));
   res.json({ from, to, trips: list, summary });
+});
+
+// Month-wise completed deliveries per driver and per unit (last 6 months).
+admin.get('/trips/monthly', (req, res) => {
+  const n = Math.max(1, Math.min(24, parseInt(req.query.months, 10) || 6));
+  const months = monthly([], n).map((x) => x.month);
+  const drivers = db().drivers.filter((d) => !d.deleted || db().trips.some((x) => x.driverId === d.id))
+    .map((d) => ({ id: d.id, name: d.name, vehicleType: d.vehicleType, months: monthly(db().trips.filter((x) => x.driverId === d.id), n) }));
+  const units = db().units.filter((u) => !u.deleted || db().trips.some((x) => x.unitId === u.id))
+    .map((u) => ({ id: u.id, name: u.name, months: monthly(db().trips.filter((x) => x.unitId === u.id), n) }));
+  res.json({ months, drivers, units });
 });
 
 admin.get('/trips.csv', (req, res) => {

@@ -200,7 +200,11 @@ async function renderUnit() {
       <div class="muted small">For a shortage or emergency. Pick any driver: a free driver is best. If you pick a driver working at another unit, they move to you and that unit is told.</div></div>
       <div class="spacer"></div><button class="primary" id="need-extra">+ Ask for an emergency driver</button></div>
       ${others(first) ? `<div style="margin-top:8px"><b class="small">Today</b>${others(first)}</div>` : ''}</div>
-    ${data.trips.length ? `<div class="card section"><h2>Deliveries today (${data.trips.filter((t) => t.dropAt).length} done)</h2>${data.trips.map((t) => tripRow(t, { showDriver: true, showUnit: false })).join('')}</div>` : ''}
+    <div class="card section"><h2>Deliveries today (${data.trips.filter((t) => t.dropAt).length} done)</h2>
+      ${data.trips.filter((t) => !t.dropAt).map((t) => tripRow(t, { showDriver: true, showUnit: false })).join('')}
+      ${data.trips.some((t) => t.dropAt) ? doneList(data.trips.filter((t) => t.dropAt), { showDriver: true }) : ''}
+      ${!data.trips.length ? '<p class="muted small">No deliveries recorded today yet.</p>' : ''}
+      <h3 style="margin-top:12px">Month-wise deliveries</h3>${monthTable(data.months)}</div>
     <div class="card"><h2>Next days</h2><div class="daylist">${list}</div></div>`;
   document.getElementById('need-extra').onclick = () => askExtra(data);
   $app.querySelectorAll('[data-cancel]').forEach((b) => (b.onclick = async () => {
@@ -405,19 +409,64 @@ async function renderDriver() {
   const open = data.trips.filter((t) => !t.dropAt);
   const done = data.trips.filter((t) => t.dropAt && t.date === data.today);
   const totalMin = done.reduce((n, t) => n + t.minutes, 0);
+  const thisMonth = data.months[0] || { count: 0, minutes: 0 };
+  const tab = state.dTab || (open.length ? 'transit' : 'done');
+  const tabBtn = (k, label) => `<button class="${tab === k ? 'on' : ''}" data-dtab="${k}">${label}</button>`;
   $app.querySelector('.wrap').innerHTML = `${hero}
     <div class="card section">
-      <div class="row"><div><h2 style="margin:0">Deliveries today</h2>
-        <div class="muted small">${done.length} delivered${done.length ? ' · ' + esc(fmtDur(totalMin)) + ' total' : ''}${open.length ? ` · <b style="color:var(--warn)">${open.length} in transit</b>` : ''}</div></div>
+      <div class="row"><div><h2 style="margin:0">Deliveries</h2>
+        <div class="muted small">Today: ${done.length} delivered${done.length ? ' · ' + esc(fmtDur(totalMin)) : ''} · This month: ${thisMonth.count} delivered${thisMonth.count ? ' · ' + esc(fmtDur(thisMonth.minutes)) : ''}</div></div>
         <div class="spacer"></div><button class="primary" id="new-pickup">📦 New pickup</button></div>
-      ${open.length ? `<div class="error" style="background:var(--warn-bg);color:var(--warn)">Complete the drop (challan photo + signature) for every pickup.</div>` : ''}
-      ${open.map((t) => `${tripRow(t)}<button class="primary" data-drop="${esc(t.id)}" style="margin:4px 0 10px">✅ Drop – upload challan</button>`).join('')}
-      ${done.map((t) => tripRow(t)).join('')}
-      ${!data.trips.length ? '<p class="muted small">Tap "New pickup" when you collect material. At delivery, tap "Drop" and upload the challan.</p>' : ''}
+      <div class="subtabs">${tabBtn('transit', `In transit (${open.length})`)}${tabBtn('done', `Completed today (${done.length})`)}${tabBtn('month', 'Monthly')}</div>
+      <div id="dtab-body"></div>
     </div>
     <div class="card"><div class="row"><h2>Next days</h2><div class="spacer"></div><span class="badge ok">${data.monthDuties} duties this month</span></div><div class="daylist">${list}</div></div>`;
-  document.getElementById('new-pickup').onclick = () => deliveryForm('pickup', { units: data.units, defaultUnit: first.unit ? first.unit.id : '', onDone: renderDriver });
-  $app.querySelectorAll('[data-drop]').forEach((b) => (b.onclick = () => deliveryForm('drop', { trip: data.trips.find((t) => t.id === b.dataset.drop), onDone: renderDriver })));
+  const body = document.getElementById('dtab-body');
+  if (tab === 'transit') {
+    body.innerHTML = open.length
+      ? `<div class="error" style="background:var(--warn-bg);color:var(--warn)">Complete the drop (challan photo + signature) for every pickup.</div>
+         ${open.map((t) => `${tripRow(t)}<button class="primary" data-drop="${esc(t.id)}" style="margin:4px 0 10px">✅ Drop – upload challan</button>`).join('')}`
+      : '<p class="muted">Nothing in transit. Tap "New pickup" when you collect material.</p>';
+  } else if (tab === 'done') {
+    body.innerHTML = done.length ? doneList(done) : '<p class="muted">No completed deliveries yet today.</p>';
+  } else {
+    body.innerHTML = '<div class="loading">Loading…</div>';
+    driverMonthly(body);
+  }
+  $app.querySelectorAll('[data-dtab]').forEach((b) => (b.onclick = () => { state.dTab = b.dataset.dtab; renderDriver(); }));
+  document.getElementById('new-pickup').onclick = () => deliveryForm('pickup', { units: data.units, defaultUnit: first.unit ? first.unit.id : '', onDone: () => { state.dTab = 'transit'; renderDriver(); } });
+  $app.querySelectorAll('[data-drop]').forEach((b) => (b.onclick = () => deliveryForm('drop', { trip: data.trips.find((t) => t.id === b.dataset.drop), onDone: () => { state.dTab = 'done'; renderDriver(); } })));
+}
+
+function fmtMonth(m) {
+  return new Date(m + '-01T00:00:00Z').toLocaleDateString('en-IN', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+}
+
+// Compact list of completed deliveries with time taken.
+function doneList(trips, { showDriver = false, showDate = false } = {}) {
+  return `<div class="done-list">${trips.map((t) => `<div class="done-row">
+      <div class="grow">
+        <div><b>${showDriver ? esc(t.driverName) + ' · ' : ''}${esc(t.unitName)}</b>${t.dropNote ? ` <span class="small muted">→ ${esc(t.dropNote)}</span>` : ''}</div>
+        <div class="small muted">${showDate ? esc(fmtDate(t.date)) + ' · ' : ''}📦 ${esc(fmtTime(t.pickupAt))} → ✅ ${esc(fmtTime(t.dropAt))}${t.pickupNote ? ' · ' + esc(t.pickupNote) : ''}</div>
+        <div class="thumbs small-thumbs">${thumb(t.pickupPhoto, 'Pickup material')}${thumb(t.pickupSign, 'Pickup signature')}${thumb(t.dropPhoto, 'Challan')}${thumb(t.dropSign, 'Drop signature')}</div>
+      </div>
+      <div class="dur">${esc(fmtDur(t.minutes))}<div class="small muted">time taken</div></div>
+    </div>`).join('')}</div>`;
+}
+
+function monthTable(months, onPick, picked) {
+  return `<div class="table-wrap section"><table><thead><tr><th>Month</th><th class="num">Deliveries</th><th class="num">Total time</th><th class="num">Avg / delivery</th></tr></thead><tbody>
+    ${months.map((m) => `<tr ${onPick ? `data-month="${m.month}" style="cursor:pointer"` : ''} class="${picked === m.month ? 'picked' : ''}"><td><b>${esc(fmtMonth(m.month))}</b></td><td class="num"><b>${m.count}</b></td><td class="num">${m.count ? esc(fmtDur(m.minutes)) : '–'}</td><td class="num">${m.count ? esc(fmtDur(Math.round(m.minutes / m.count))) : '–'}</td></tr>`).join('')}
+  </tbody></table></div>`;
+}
+
+async function driverMonthly(body, month) {
+  const r = await api('/driver/trips' + (month ? '?month=' + month : ''));
+  body.innerHTML = `${monthTable(r.months.filter((m, i) => i === 0 || m.count || m.month === r.month), true, r.month)}
+    <h3>${esc(fmtMonth(r.month))} – ${r.trips.length} completed</h3>
+    ${r.trips.length ? doneList(r.trips, { showDate: true }) : '<p class="muted">No completed deliveries this month.</p>'}
+    <p class="muted small">Tap a month to see its deliveries.</p>`;
+  body.querySelectorAll('[data-month]').forEach((tr) => (tr.onclick = () => driverMonthly(body, tr.dataset.month)));
 }
 
 // ---------- admin ----------
@@ -779,7 +828,7 @@ async function adminDeliveries(main) {
   const t = A().today;
   const from = state.delFrom || t;
   const to = state.delTo || from;
-  const r = await api(`/admin/trips?from=${from}&to=${to}`);
+  const [r, mon] = await Promise.all([api(`/admin/trips?from=${from}&to=${to}`), api('/admin/trips/monthly?months=6')]);
   const drivers = state.delDriver || '';
   const list = r.trips.filter((x) => !drivers || x.driverId === drivers);
   const done = list.filter((x) => x.dropAt);
@@ -797,7 +846,10 @@ async function adminDeliveries(main) {
     ${r.summary.length ? `<div class="table-wrap section"><table><thead><tr><th>Driver</th><th class="num">Delivered</th><th class="num">Not dropped</th><th class="num">Total time</th><th class="num">Avg / delivery</th></tr></thead><tbody>${sumRows}</tbody></table></div>` : '<div class="card muted section">No deliveries recorded for these dates.</div>'}
     ${r.trips.length ? `<div class="row"><h2>All deliveries</h2><div class="spacer"></div>
       <select id="ddrv" style="width:auto"><option value="">All drivers</option>${r.summary.map((x) => `<option value="${esc(x.driverId)}" ${drivers === x.driverId ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></div>
-      <div class="card">${list.map((x) => `${tripRow(x, { showDriver: true })}<div class="row" style="justify-content:flex-end"><span class="muted small">${esc(fmtDate(x.date))}</span><button class="link danger small" data-deltrip="${esc(x.id)}">Delete</button></div>`).join('')}</div>` : ''}
+      <div class="card">${list.map((x) => `${x.dropAt ? doneList([x], { showDriver: true, showDate: true }) : tripRow(x, { showDriver: true })}<div class="row" style="justify-content:flex-end"><button class="link danger small" data-deltrip="${esc(x.id)}">Delete</button></div>`).join('')}</div>` : ''}
+    <h2 style="margin-top:18px">Month-wise (completed deliveries · time)</h2>
+    ${monthGrid(mon.months, mon.drivers, 'Driver')}
+    ${monthGrid(mon.months, mon.units, 'Unit')}
     <p class="muted small">Photos are kept for ${esc(A().settings.photoDays || 120)} days (change in Settings); times and names are kept forever. ${done.length ? '' : ''}</p>`;
   document.getElementById('dgo').onclick = () => { state.delFrom = document.getElementById('df').value; state.delTo = document.getElementById('dt').value; renderAdmin(); };
   const dd = document.getElementById('ddrv');
@@ -806,6 +858,12 @@ async function adminDeliveries(main) {
     if (!confirm('Delete this delivery entry and its photos?')) return;
     try { await api(`/admin/trips/${b.dataset.deltrip}`, { method: 'DELETE' }); toast('Deleted'); renderAdmin(); } catch (ex) { toast(ex.message, true); }
   }));
+}
+
+function monthGrid(months, rows, label) {
+  const cell = (m) => (m.count ? `<b>${m.count}</b><div class="small muted">${esc(fmtDur(m.minutes))}</div>` : '<span class="muted">–</span>');
+  return `<div class="table-wrap section"><table><thead><tr><th>${label}</th>${months.map((m) => `<th class="num">${esc(new Date(m + '-01T00:00:00Z').toLocaleDateString('en-IN', { month: 'short', year: '2-digit', timeZone: 'UTC' }))}</th>`).join('')}</tr></thead>
+    <tbody>${rows.map((r) => `<tr><td><b>${esc(r.name)}</b>${r.vehicleType ? ' ' + vbadge(r.vehicleType) : ''}</td>${r.months.map((m) => `<td class="num">${cell(m)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 
 // --- Settings ---
