@@ -502,14 +502,14 @@ function fmtMonth(m) {
 function doneList(trips, { showDriver = false, showDate = false } = {}) {
   return `<div class="done-list">${trips.map((t) => `<div class="done-row">
       <div class="grow">
-        <div><b>${showDriver ? esc(t.driverName) + ' · ' : ''}${esc(t.unitName)} → ${esc(t.dropName || '?')}</b> ${t.dropName ? (t.internal ? '<span class="badge">Internal</span>' : '<span class="badge ok">External</span>') : ''}${t.dropNote ? ` <span class="small muted">${esc(t.dropNote)}</span>` : ''}</div>
+        <div><b>${showDriver ? esc(t.driverName) + ' · ' : ''}${esc(t.unitName)}${t.dropName ? ' → ' + esc(t.dropName) : ''}</b> ${t.dropName ? (t.internal ? '<span class="badge">Internal</span>' : '<span class="badge ok">External</span>') : ''}${t.dropNote ? ` <span class="small muted">${esc(t.dropNote)}</span>` : ''}</div>
         <div class="small muted">${showDate ? esc(fmtDate(t.date)) + ' · ' : ''}📦 ${esc(fmtTime(t.pickupAt))} → ✅ ${esc(fmtTime(t.dropAt))}${t.pickupNote ? ' · ' + esc(t.pickupNote) : ''}</div>
         ${tripRemarks(t)}
         <div class="thumbs small-thumbs">${thumb(t.pickupPhoto, 'Pickup material')}${thumb(t.pickupSign, 'Pickup signature')}${thumb(t.dropPhoto, 'Challan')}${thumb(t.dropSign, 'Drop signature')}</div>
       </div>
       ${t.wrongEntry
         ? `<div class="dur" style="color:var(--bad)">Wrong entry<div class="small muted">${esc(fmtDur(t.rawMinutes))} · not counted</div></div>`
-        : `<div class="dur">${esc(fmtDur(t.minutes))}<div class="small muted">time taken</div><div class="bonus">${esc(money(t.incentive))}</div><div class="small muted">${t.minutes ? `${t.minutes} min × ${t.rate}${t.internal ? ` × ${t.incentivePct}%` : ''}` : ''}</div></div>`}
+        : `<div class="dur">${esc(fmtDur(t.minutes))}<div class="small muted">time taken</div><div class="bonus">${esc(money(t.incentive))}</div></div>`}
     </div>`).join('')}</div>`;
 }
 

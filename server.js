@@ -291,7 +291,21 @@ function unitName(id) {
 }
 
 // Internal = picked up at a unit and dropped at a unit.
+// The amount is locked when the delivery is dropped (or corrected by the admin), so later
+// changes to the rates in Settings do not change past deliveries.
 function tripIncentive(t, minutes) {
+  const internal = !!(t.unitId && t.dropUnitId);
+  if (t.incentive && typeof t.incentive.amount === 'number') return { internal, ...t.incentive };
+  return calcIncentive(t, minutes);
+}
+
+function lockIncentive(t) {
+  if (!t.dropAt) { delete t.incentive; return; }
+  const { rate, pct, amount } = calcIncentive(t, tripMinutes(t));
+  t.incentive = { rate, pct, amount };
+}
+
+function calcIncentive(t, minutes) {
   const internal = !!(t.unitId && t.dropUnitId);
   const rate = incentiveRate(minutes);
   const pct = internal ? (db().settings.incentive || DEFAULT_INCENTIVE).internalPercent : 100;
@@ -418,6 +432,7 @@ app.post('/api/driver/trips/:id/drop', need('driver'), (req, res) => {
       dropUnitId: dest.unitId, dropOther: dest.other,
       dropSigner: str(req.body.signer, 80), dropNote: str(req.body.note, 300),
     });
+    lockIncentive(trip);
     store.save();
     res.json({ ok: true, trip: tripView(trip) });
   } catch (e) {
@@ -466,6 +481,11 @@ function cleanupPhotos() {
   if (changed) store.save();
 }
 cleanupPhotos();
+// Lock the amount on deliveries completed before amounts were locked.
+if (db().trips.some((t) => t.dropAt && !t.incentive)) {
+  db().trips.forEach((t) => t.dropAt && !t.incentive && lockIncentive(t));
+  store.save();
+}
 setInterval(cleanupPhotos, 6 * 3600 * 1000).unref();
 
 const admin = express.Router();
@@ -786,6 +806,7 @@ admin.get('/trips.csv', (req, res) => {
 admin.post('/trips/:id/edit', (req, res) => {
   const trip = db().trips.find((x) => x.id === req.params.id);
   if (!trip) return res.status(404).json({ error: 'Not found' });
+  const before = [trip.pickupAt, trip.dropAt, trip.unitId, trip.pickupOther, trip.dropUnitId, trip.dropOther].join('|');
   const tz = db().settings.timezone;
   const pickupAt = req.body.pickup ? zonedToIso(req.body.pickup, tz) : trip.pickupAt;
   const dropAt = req.body.drop ? zonedToIso(req.body.drop, tz) : trip.dropAt;
@@ -808,6 +829,8 @@ admin.post('/trips/:id/edit', (req, res) => {
     if (p.error) return bad(res, 'Drop to: ' + p.error);
     trip.dropUnitId = p.unitId; trip.dropOther = p.other;
   }
+  const after = [trip.pickupAt, trip.dropAt, trip.unitId, trip.pickupOther, trip.dropUnitId, trip.dropOther].join('|');
+  if (after !== before) lockIncentive(trip); // time or place changed: recalculate with current rates
   store.save();
   res.json({ ok: true });
 });
