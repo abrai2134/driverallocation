@@ -16,7 +16,7 @@ if (!store.db.settings.photoDays) store.db.settings.photoDays = 120;
 // (unit to unit) deliveries get internalPercent of that.
 const DEFAULT_INCENTIVE = {
   slabs: [{ upTo: 60, rate: 0.25 }, { upTo: 120, rate: 0.35 }, { upTo: 240, rate: 0.4 }, { upTo: 360, rate: 0.45 }],
-  internalPercent: 50,
+  internalPercent: 25,
 };
 if (!store.db.settings.incentive) store.db.settings.incentive = DEFAULT_INCENTIVE;
 
